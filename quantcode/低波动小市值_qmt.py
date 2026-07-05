@@ -1,14 +1,11 @@
-# coding:utf-8
 """
 QMT 转换版：低波动小市值
 
 原始策略来自聚宽：小市值 + Barra CNE6 量价因子。
-本文件参考 quantcode/qmt示例-多因子选股回测示例.py 的回测写法：
 init(ContextInfo) 初始化，handlebar(ContextInfo) 在日线 bar 中执行每日任务。
 """
 
 import datetime
-from datetime import timedelta
 
 import numpy as np
 import pandas as pd
