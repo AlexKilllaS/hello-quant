@@ -17,7 +17,6 @@ class G:
 
 g = G()
 
-
 FIELD_ALIASES = {
     "close": ["close"],
     "open": ["open"],
@@ -38,10 +37,10 @@ FIELD_ALIASES = {
 }
 
 INDEX_SECTOR_NAME_MAP = {
-    "000300.SH": ["沪深300"],
-    "000905.SH": ["中证500"],
-    "000016.SH": ["上证50"],
-    "399101.SZ": ["中小综指", "中小板综", "中小企业综合指数"],
+    "000300.SH": "沪深300",
+    "000905.SH": "中证500",
+    "000016.SH": "上证50",
+    "399101.SZ": "中小综指",
 }
 
 
@@ -49,7 +48,7 @@ def init(ContextInfo):
     # -------- 标的与账户 --------
     g.benchmark = "000300.SH"
     g.index_code = "399101.SZ"
-    g.index_sector_names = INDEX_SECTOR_NAME_MAP.get(g.index_code, [g.index_code])
+    g.index_sector_name = INDEX_SECTOR_NAME_MAP.get(g.index_code)
     g.accountID = "testS"
 
     # -------- 策略核心参数 --------
@@ -92,6 +91,7 @@ def init(ContextInfo):
     # -------- QMT 回测状态 --------
     g.s = _get_sector_stocks(ContextInfo, g.index_code)
     if g.s:
+        # 设定股票池
         ContextInfo.set_universe(g.s)
 
     g.holdings = {stock: 0 for stock in g.s}
@@ -124,7 +124,7 @@ def init(ContextInfo):
 
 
 def handlebar(ContextInfo):
-    if hasattr(ContextInfo, "is_new_bar") and not ContextInfo.is_new_bar():
+    if not ContextInfo.is_new_bar():
         return
 
     _update_calendar_state(ContextInfo)
@@ -151,8 +151,10 @@ def handlebar(ContextInfo):
 # 日历与 QMT 兼容工具
 # ==============================================================================
 def _get_current_date(ContextInfo):
-    barpos = getattr(ContextInfo, "barpos", 0)
+    # 当前 K 线索引号
+    barpos = ContextInfo.barpos
     try:
+        # 用于获取当前K线对应的时间的时间戳，返回的是毫秒表示的时间数值。
         tag = ContextInfo.get_bar_timetag(barpos)
         date_text = timetag_to_datetime(tag, "%Y%m%d")
         if isinstance(date_text, datetime.datetime):
@@ -173,14 +175,14 @@ def _bar_time(ContextInfo, fmt="%Y%m%d%H%M%S"):
 
 def _update_calendar_state(ContextInfo):
     current_date = _get_current_date(ContextInfo)
-    if getattr(g, "_current_date", None) == current_date:
+    if g._current_date == current_date:
         return
 
-    g._previous_trade_date = getattr(g, "_current_date", None)
+    g._previous_trade_date = g._current_date
     g._current_date = current_date
     week_key = current_date.isocalendar()[:2]
 
-    if getattr(g, "_week_key", None) != week_key:
+    if g._week_key != week_key:
         g._week_key = week_key
         g._week_trading_day = 1
     else:
@@ -202,15 +204,15 @@ def _date_to_yyyymmdd(date_value):
 
 
 def _get_sector_stocks(ContextInfo, sector_code):
-    sector_names = INDEX_SECTOR_NAME_MAP.get(sector_code, [sector_code])
-    for sector_name in sector_names:
-        try:
-            stocks = ContextInfo.get_stock_list_in_sector(sector_name)
-        except Exception:
-            stocks = []
-        if stocks:
-            return list(stocks)
-    print("获取板块成分股失败 {}, 请确认 QMT 本地板块名: {}".format(sector_code, sector_names))
+    sector_name = INDEX_SECTOR_NAME_MAP.get(sector_code, [sector_code])
+    try:
+        # 获取板块成份股,支持客户端左侧板块列表中任意的板块,包括自定义板块
+        stocks = ContextInfo.get_stock_list_in_sector(sector_name)
+    except Exception:
+        stocks = []
+    if stocks:
+        return list(stocks)
+    print("获取板块成分股失败 {}, 请确认 QMT 本地板块名: {}".format(sector_code, sector_name))
     return []
 
 
@@ -611,7 +613,7 @@ def get_stock_list(ContextInfo):
     if cap_df is not None and not cap_df.empty and cap_df["market_cap"].notna().any():
         cap_df = cap_df[
             (cap_df["market_cap"] >= 5) & (cap_df["market_cap"] <= 50)
-        ].sort_values("market_cap")
+            ].sort_values("market_cap")
         if cap_df.empty:
             return []
         candidate_list = cap_df["code"].tolist()
@@ -852,9 +854,9 @@ def calc_barra_factors(ContextInfo, stock_list, market_cap_map=None):
 
             finite_total_value = total_value[np.isfinite(total_value)]
             if (
-                len(total_value) != len(close)
-                or len(finite_total_value) == 0
-                or np.nanmax(finite_total_value) <= 0
+                    len(total_value) != len(close)
+                    or len(finite_total_value) == 0
+                    or np.nanmax(finite_total_value) <= 0
             ):
                 cap_yi = market_cap_map.get(code, np.nan)
                 if np.isfinite(cap_yi) and cap_yi > 0:
@@ -1135,9 +1137,9 @@ def filter_limitup_stock(ContextInfo, stock_list):
         close_price = _previous(close_data, stock)
         high_limit = _previous(high_limit_data, stock)
         is_limit = (
-            np.isfinite(close_price)
-            and np.isfinite(high_limit)
-            and abs(close_price - high_limit) <= max(0.01, high_limit * 0.0001)
+                np.isfinite(close_price)
+                and np.isfinite(high_limit)
+                and abs(close_price - high_limit) <= max(0.01, high_limit * 0.0001)
         )
         if stock in hold_set or not is_limit:
             result.append(stock)
@@ -1157,9 +1159,9 @@ def filter_limitdown_stock(ContextInfo, stock_list):
         close_price = _previous(close_data, stock)
         low_limit = _previous(low_limit_data, stock)
         is_limit = (
-            np.isfinite(close_price)
-            and np.isfinite(low_limit)
-            and abs(close_price - low_limit) <= max(0.01, low_limit * 0.0001)
+                np.isfinite(close_price)
+                and np.isfinite(low_limit)
+                and abs(close_price - low_limit) <= max(0.01, low_limit * 0.0001)
         )
         if stock in hold_set or not is_limit:
             result.append(stock)
@@ -1173,7 +1175,7 @@ def filter_highprice_stock(ContextInfo, stock_list):
     return [
         stock for stock in stock_list
         if stock in g.hold_list
-        or _latest(close_data, stock, default=np.inf) <= g.up_price
+           or _latest(close_data, stock, default=np.inf) <= g.up_price
     ]
 
 
