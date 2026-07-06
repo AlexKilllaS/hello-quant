@@ -1,0 +1,4 @@
+interface:
+  display_name: "JQ to QMT"
+  short_description: "Convert JoinQuant to QMT built-in Python"
+  default_prompt: "Use $jq-to-qmt to convert a JoinQuant strategy file into QMT built-in Python code and a migration report."

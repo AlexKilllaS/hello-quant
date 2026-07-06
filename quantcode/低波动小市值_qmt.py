@@ -1,9 +1,8 @@
-#coding:gbk
+# coding: utf-8
 """
 QMT 转换版：低波动小市值
 
 原始策略来自聚宽：小市值 + Barra CNE6 量价因子。
-本文件参考 quantcode/qmt示例-多因子选股回测示例.py 的回测写法：
 init(ContextInfo) 初始化，handlebar(ContextInfo) 在日线 bar 中执行每日任务。
 """
 
@@ -25,7 +24,6 @@ LIMIT_PRICE_MIN_DIFF = 0.01
 LIMIT_PRICE_REL_DIFF = 0.0001
 FACTOR_NAMES = ("HSIGMA", "DASTD", "CMRA", "STOM", "STOQ", "STOA", "ATVR")
 
-
 FIELD_ALIASES = {
     "close": ["close"],
     "open": ["open"],
@@ -46,10 +44,10 @@ FIELD_ALIASES = {
 }
 
 INDEX_SECTOR_NAME_MAP = {
-    "000300.SH": ["沪深300"],
-    "000905.SH": ["中证500"],
-    "000016.SH": ["上证50"],
-    "399101.SZ": ["中小综指", "中小板综", "中小企业综合指数"],
+    "000300.SH": "沪深300",
+    "000905.SH": "中证500",
+    "000016.SH": "上证50",
+    "399101.SZ": "中小综指",
 }
 
 
@@ -153,8 +151,10 @@ def handlebar(ContextInfo):
 # 日历与 QMT 兼容工具
 # ==============================================================================
 def _get_current_date(ContextInfo):
+    # 当前 K 线索引号
     barpos = ContextInfo.barpos
     try:
+        # 用于获取当前K线对应的时间的时间戳，返回的是毫秒表示的时间数值。
         tag = ContextInfo.get_bar_timetag(barpos)
         date_text = timetag_to_datetime(tag, "%Y%m%d")
         if isinstance(date_text, datetime.datetime):
