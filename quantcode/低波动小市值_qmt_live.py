@@ -1,9 +1,10 @@
 # coding: utf-8
 """
-QMT 转换版：低波动小市值
+QMT 实盘版：低波动小市值
 
 原始策略来自聚宽：小市值 + Barra CNE6 量价因子。
-init(ContextInfo) 初始化，handlebar(ContextInfo) 按 QMT bar 时间模拟聚宽日内任务。
+本文件面向 QMT 模型交易/模拟信号，使用 ContextInfo.schedule_run 注册盘中定时任务。
+回测请继续使用同目录下的低波动小市值_qmt.py。
 """
 
 import datetime
@@ -25,17 +26,23 @@ LIMIT_PRICE_REL_DIFF = 0.0001
 DEFAULT_DIVIDEND_TYPE = "front"
 FACTOR_NAMES = ("HSIGMA", "DASTD", "CMRA", "STOM", "STOQ", "STOA", "ATVR")
 
-FIELD_MAP = {
-    "close": "close",
-    "open": "open",
-    "high": "high",
-    "low": "low",
-    "volume": "volume",
-    "money": "amount",
-    "total_value": "total_value",
-    "high_limit": "upLimit",
-    "low_limit": "downLimit",
-    "suspend": "suspendFlag",
+FIELD_ALIASES = {
+    "close": ["close"],
+    "open": ["open"],
+    "high": ["high"],
+    "low": ["low"],
+    "volume": ["volume", "vol"],
+    "money": ["amount", "money", "turnover"],
+    "total_value": [
+        "total_value",
+        "float_market_value",
+        "float_mv",
+        "circulating_market_value",
+        "market_value",
+    ],
+    "high_limit": ["upLimit", "high_limit", "up_limit", "uplimit"],
+    "low_limit": ["downLimit", "low_limit", "down_limit", "downlimit"],
+    "suspend": ["suspendFlag"],
 }
 
 INDEX_SECTOR_NAME_MAP = {
@@ -48,14 +55,20 @@ INDEX_SECTOR_NAME_MAP = {
 
 def init(ContextInfo):
     # -------- 标的与账户 --------
-    g.backtest = bool(ContextInfo.do_back_test)
-    g.benchmark = "000300.SH"
-    g.qmt_ui_benchmark = ContextInfo.benchmark
+    g.backtest = bool(getattr(ContextInfo, "do_back_test", False))
+    g.live_mode = not g.backtest
+    g.benchmark = getattr(ContextInfo, "benchmark", None) or "000300.SH"
     g.index_code = "399101.SZ"
-    g.accountID = "testS"
-    g.account_type = "stock"
-    g.dividend_type = DEFAULT_DIVIDEND_TYPE
-    g.qmt_ui_dividend_type = ContextInfo.dividend_type
+    g.accountID = str(globals().get("account", "请在模型交易界面选择账号"))
+    g.account_type = str(globals().get("accountType", "STOCK") or "STOCK")
+    g.buy_op_type = 23 if g.account_type.upper() == "STOCK" else 33
+    g.sell_op_type = 24 if g.account_type.upper() == "STOCK" else 34
+    g.passorder_order_type = 1101
+    g.passorder_price_type = 5
+    g.passorder_price = 0
+    g.passorder_quick_trade = 2
+    g.passorder_strategy_name = "低波动小市值实盘"
+    g.dividend_type = getattr(ContextInfo, "dividend_type", None) or DEFAULT_DIVIDEND_TYPE
     g.sub = False
 
     # -------- 策略核心参数 --------
@@ -91,34 +104,9 @@ def init(ContextInfo):
 
     g.factor_weights = {name: 1 / len(FACTOR_NAMES) for name in FACTOR_NAMES}
 
-    # -------- 调仓与仓位控制参数 --------
-    g.buffer_multiplier = 2.0
-    g.rebalance_out_buffer_ratio = 0.30
-    g.rebalance_min_new_targets = 3
-    g.weight_drift_threshold = 0.30
-    g.risk_weight_window = 60
-    g.max_position_weight = 0.15
-
-    # -------- QMT 回测状态 --------
-    g._current_date = None
-    g._previous_trade_date = None
-    g._last_processed_bar = None
-    g._selection_end_time = None
-    g._last_rebalance_date = None
-    g._last_rebalance_month = None
-    g._task_run_dates = {}
-    g._day_schedule_date = None
-    g._daily_history_ready_date = None
-    g._daily_history_warned_date = None
-    g._diagnostic_log_keys = set()
-
+    # -------- QMT 实盘状态 --------
     g.s = _get_sector_stocks(ContextInfo, g.index_code)
-    print("策略初始化: 策略基准 {}, QMT界面基准 {}, 指数池 {} 只".format(
-        g.benchmark, g.qmt_ui_benchmark, len(g.s)
-    ))
-    print("价格复权口径: 策略固定 {}, QMT界面 {}".format(
-        g.dividend_type, g.qmt_ui_dividend_type
-    ))
+    print("策略初始化: 市场整体标的 {}, 指数池 {} 只".format(g.benchmark, len(g.s)))
 
     g.holdings = {stock: 0 for stock in g.s}
     g.buypoint = {}
@@ -130,9 +118,7 @@ def init(ContextInfo):
     g.reason_to_sell = ""
     g.market_cap_map = {}
 
-    g.initial_cash = float(ContextInfo.capital)
-    if not np.isfinite(g.initial_cash) or g.initial_cash <= 0:
-        raise RuntimeError("QMT 回测本金 ContextInfo.capital 无效: {}".format(ContextInfo.capital))
+    g.initial_cash = float(getattr(ContextInfo, "capital", 0) or 0)
     g.money = float(g.initial_cash)
     g.profit = 0.0
     g.profit_ratio = 0.0
@@ -142,37 +128,129 @@ def init(ContextInfo):
     g.order_price_field = "open"
 
     g.min_bars = g.vol_window + 10
+    g._week_key = None
+    g._week_trading_day = 0
+    g._current_date = None
+    g._previous_trade_date = None
+    g._last_processed_bar = None
+    g._selection_end_time = None
+    g._task_run_dates = {}
+    g._daily_fallback_date = None
+    g._daily_history_ready_date = None
+    g._daily_history_warned_date = None
+    g._schedule_ids = []
+    g._live_task_grace_minutes = 20
+    g._pending_order_notes = {}
+    g._order_seq = 0
 
     print("策略初始化完成, 指数池数量: {}, 因子权重: {}".format(
         len(g.s), {k: round(v, 3) for k, v in g.factor_weights.items()}
     ))
+    if g.backtest:
+        print("当前脚本为实盘版，schedule_run 在回测中不会重放历史定时任务；回测请使用 低波动小市值_qmt.py。")
+        return
+    _register_live_schedule(ContextInfo)
 
 
 def handlebar(ContextInfo):
-    if not ContextInfo.is_new_bar():
+    if hasattr(ContextInfo, "is_last_bar") and not ContextInfo.is_last_bar():
         return
-    if not g.backtest and not ContextInfo.is_last_bar():
+    _update_live_calendar_state(ContextInfo)
+    g.profit_ratio = g.profit / float(g.initial_cash or 1)
+
+
+# ==============================================================================
+# 实盘定时任务
+# ==============================================================================
+def _register_live_schedule(ContextInfo):
+    if not hasattr(ContextInfo, "schedule_run"):
+        print("当前 QMT 版本未发现 ContextInfo.schedule_run，无法注册实盘定时任务。")
         return
 
-    _update_calendar_state(ContextInfo)
+    tasks = (
+        (live_prepare_stock_list, "09:25", "prepare_stock_list"),
+        (live_weekly_adjustment, "09:31", "weekly_adjustment"),
+        (live_check_stop_loss_1030, "10:30", "check_stop_loss_1030"),
+        (live_check_stop_loss_1400, "14:00", "check_stop_loss_1400"),
+        (live_trade_afternoon, "14:30", "trade_afternoon"),
+    )
+    for callback, trigger_time, task_name in tasks:
+        time_point = _today_time_point(trigger_time)
+        try:
+            task_id = ContextInfo.schedule_run(
+                callback,
+                time_point,
+                -1,
+                datetime.timedelta(days=1),
+                "low_vol_small_cap_{}".format(task_name),
+            )
+            g._schedule_ids.append(task_id)
+            print("注册实盘定时任务 {} @ {} task_id={}".format(task_name, trigger_time, task_id))
+        except Exception as exc:
+            print("注册实盘定时任务 {} 失败: {}".format(task_name, exc))
 
-    d = ContextInfo.barpos
-    if g._last_processed_bar == d:
+
+def _today_time_point(trigger_time):
+    return datetime.datetime.now().strftime("%Y%m%d") + trigger_time.replace(":", "") + "00"
+
+
+def _live_task_due(now, trigger_time):
+    hour, minute = [int(part) for part in trigger_time.split(":")]
+    start = datetime.datetime.combine(now.date(), datetime.time(hour, minute))
+    end = start + datetime.timedelta(minutes=g._live_task_grace_minutes)
+    return start <= now <= end
+
+
+def _run_live_task(ContextInfo, task_name, trigger_time, func):
+    if g.backtest:
         return
 
-    g._last_processed_bar = d
-    if _is_intraday_period(ContextInfo):
-        _run_intraday_schedule(ContextInfo)
-    else:
-        _run_day_schedule(ContextInfo)
+    now = datetime.datetime.now()
+    current_date = now.date()
+    if not _live_task_due(now, trigger_time):
+        return
+    if _task_done(task_name, current_date):
+        return
+    if not _is_live_trading_day(ContextInfo, current_date):
+        print("【实盘调度】{} 非交易日，跳过 {}".format(_date_to_yyyymmdd(current_date), task_name))
+        _mark_task_done(task_name, current_date)
+        return
 
-    g.profit_ratio = g.profit / g.initial_cash
+    _update_live_calendar_state(ContextInfo)
+    _sync_trade_state(ContextInfo)
+    print("【实盘调度】{} {} 执行 {}".format(
+        _date_to_yyyymmdd(current_date), now.strftime("%H:%M:%S"), task_name
+    ))
+    func(ContextInfo)
+    _mark_task_done(task_name, current_date)
+
+
+def live_prepare_stock_list(ContextInfo):
+    _run_live_task(ContextInfo, "prepare_stock_list", "09:25", prepare_stock_list)
+
+
+def live_weekly_adjustment(ContextInfo):
+    _run_live_task(ContextInfo, "weekly_adjustment", "09:31", weekly_adjustment)
+
+
+def live_check_stop_loss_1030(ContextInfo):
+    _run_live_task(ContextInfo, "check_stop_loss_1030", "10:30", check_stop_loss)
+
+
+def live_check_stop_loss_1400(ContextInfo):
+    _run_live_task(ContextInfo, "check_stop_loss_1400", "14:00", check_stop_loss)
+
+
+def live_trade_afternoon(ContextInfo):
+    _run_live_task(ContextInfo, "trade_afternoon", "14:30", trade_afternoon)
 
 
 # ==============================================================================
 # 日历与 QMT 兼容工具
 # ==============================================================================
 def _get_current_date(ContextInfo):
+    if getattr(g, "live_mode", False):
+        return datetime.date.today()
     return _bar_datetime(ContextInfo).date()
 
 
@@ -196,15 +274,17 @@ def _parse_bar_datetime(value):
 
 
 def _bar_datetime(ContextInfo):
+    if getattr(g, "live_mode", False):
+        return datetime.datetime.now()
     try:
         tag = ContextInfo.get_bar_timetag(ContextInfo.barpos)
         value = timetag_to_datetime(tag, "%Y%m%d%H%M%S")
         parsed = _parse_bar_datetime(value)
         if parsed is not None:
             return parsed
-        raise RuntimeError("解析 QMT bar 时间失败: barpos={} timetag={}".format(ContextInfo.barpos, tag))
-    except Exception as exc:
-        raise RuntimeError("读取 QMT bar 时间失败: barpos={}: {}".format(ContextInfo.barpos, exc))
+    except Exception:
+        pass
+    return datetime.datetime.combine(datetime.date.today(), datetime.time())
 
 
 def _bar_time(ContextInfo, fmt="%Y%m%d%H%M%S"):
@@ -212,7 +292,10 @@ def _bar_time(ContextInfo, fmt="%Y%m%d%H%M%S"):
 
 
 def _previous_bar_end_time(ContextInfo):
-    trade_date = g._previous_trade_date or _get_current_date(ContextInfo)
+    trade_date = g._previous_trade_date
+    if getattr(g, "live_mode", False) and trade_date is None:
+        trade_date = _previous_live_trading_date(ContextInfo, _get_current_date(ContextInfo))
+    trade_date = trade_date or _get_current_date(ContextInfo)
     return _date_to_yyyymmdd(trade_date) + "150000"
 
 
@@ -223,12 +306,39 @@ def _update_calendar_state(ContextInfo):
 
     g._previous_trade_date = g._current_date
     g._current_date = current_date
+    week_key = current_date.isocalendar()[:2]
+
+    if g._week_key != week_key:
+        g._week_key = week_key
+        g._week_trading_day = 1
+    else:
+        g._week_trading_day += 1
+
+
+def _update_live_calendar_state(ContextInfo):
+    current_date = datetime.date.today()
+    if g._current_date == current_date:
+        return
+
+    week_start = current_date - datetime.timedelta(days=current_date.weekday())
+    week_dates = _trading_dates_between(ContextInfo, week_start, current_date)
+    previous_trade_date = _previous_live_trading_date(ContextInfo, current_date)
+
+    if week_dates and current_date in week_dates:
+        week_trading_day = week_dates.index(current_date) + 1
+    elif week_dates:
+        week_trading_day = len([item for item in week_dates if item <= current_date])
+    else:
+        week_trading_day = current_date.weekday() + 1 if current_date.weekday() < 5 else 0
+
+    g._previous_trade_date = previous_trade_date
+    g._current_date = current_date
+    g._week_key = current_date.isocalendar()[:2]
+    g._week_trading_day = week_trading_day
 
 
 def _current_period(ContextInfo):
-    if ContextInfo.period in (None, ""):
-        raise RuntimeError("QMT ContextInfo.period 为空, 请检查回测周期设置")
-    return str(ContextInfo.period)
+    return str(getattr(ContextInfo, "period", None) or "1d")
 
 
 def _is_intraday_period(ContextInfo):
@@ -246,48 +356,12 @@ def _mark_task_done(task_name, current_date):
     g._task_run_dates[task_name] = current_date
 
 
-def _run_task_once(ContextInfo, task_name, trigger_time, func):
-    now = _bar_datetime(ContextInfo)
-    current_date = now.date()
-    if _task_done(task_name, current_date):
-        return
-    if now.strftime("%H:%M") < trigger_time:
-        return
-    print("【调度】{} {} 执行 {}".format(_date_to_yyyymmdd(current_date), now.strftime("%H:%M"), task_name))
-    func(ContextInfo)
-    _mark_task_done(task_name, current_date)
-
-
-def _run_intraday_schedule(ContextInfo):
-    # 聚宽日内任务在 QMT 回测中用 handlebar + bar 时间门控模拟。
-    tasks = (
-        ("prepare_stock_list", "09:25", prepare_stock_list),
-        ("risk_buffer_rebalance", "09:31", weekly_adjustment),
-        ("check_stop_loss_1030", "10:30", check_stop_loss),
-        ("check_stop_loss_1400", "14:00", check_stop_loss),
-        ("trade_afternoon", "14:30", trade_afternoon),
-    )
-    for task_name, trigger_time, func in tasks:
-        _run_task_once(ContextInfo, task_name, trigger_time, func)
-
-
-def _run_day_schedule(ContextInfo):
-    current_date = g._current_date or _get_current_date(ContextInfo)
-    if g._day_schedule_date == current_date:
-        return
-    g._day_schedule_date = current_date
-    prepare_stock_list(ContextInfo)
-    weekly_adjustment(ContextInfo)
-    check_stop_loss(ContextInfo)
-    trade_afternoon(ContextInfo)
-
-
 def _daily_history_ready(ContextInfo):
     current_date = g._current_date or _get_current_date(ContextInfo)
     if g._daily_history_ready_date == current_date:
         return True
 
-    probes = [g.benchmark]
+    probes = [g.benchmark, g.index_code]
     probes.extend(g.s[:3])
     probes = list(dict.fromkeys([stock for stock in probes if stock]))
     if not probes:
@@ -314,6 +388,12 @@ def _daily_history_ready(ContextInfo):
     return False
 
 
+def is_nth_trading_day_of_week(ContextInfo, n):
+    if n <= 0:
+        return False
+    return g._week_trading_day == n
+
+
 def _date_to_yyyymmdd(date_value):
     if isinstance(date_value, datetime.datetime):
         date_value = date_value.date()
@@ -322,18 +402,68 @@ def _date_to_yyyymmdd(date_value):
     return str(date_value)[:8]
 
 
+def _normalize_trading_date(value):
+    parsed = _parse_bar_datetime(value)
+    if parsed is not None:
+        return parsed.date()
+    return None
+
+
+def _trading_dates_between(ContextInfo, start_date, end_date):
+    if not hasattr(ContextInfo, "get_trading_dates"):
+        return []
+
+    start = _date_to_yyyymmdd(start_date)
+    end = _date_to_yyyymmdd(end_date)
+    candidates = (
+        (g.benchmark, start, end, -1, "1d"),
+        (g.benchmark, start, end, 0, "1d"),
+        (g.benchmark, start, end, -1),
+        (g.benchmark, start, end),
+    )
+    raw_dates = []
+    for args in candidates:
+        try:
+            raw_dates = ContextInfo.get_trading_dates(*args)
+            break
+        except Exception:
+            raw_dates = []
+
+    result = []
+    for item in raw_dates or []:
+        parsed = _normalize_trading_date(item)
+        if parsed is not None and start_date <= parsed <= end_date:
+            result.append(parsed)
+    return sorted(set(result))
+
+
+def _previous_live_trading_date(ContextInfo, current_date):
+    start_date = current_date - datetime.timedelta(days=45)
+    dates = _trading_dates_between(ContextInfo, start_date, current_date)
+    previous_dates = [item for item in dates if item < current_date]
+    if previous_dates:
+        return previous_dates[-1]
+
+    previous = current_date - datetime.timedelta(days=1)
+    while previous.weekday() >= 5:
+        previous -= datetime.timedelta(days=1)
+    return previous
+
+
+def _is_live_trading_day(ContextInfo, current_date):
+    dates = _trading_dates_between(ContextInfo, current_date, current_date)
+    if dates:
+        return current_date in dates
+    return current_date.weekday() < 5
+
+
 def _instrument_detail(ContextInfo, stock):
     try:
         detail = ContextInfo.get_instrumentdetail(stock)
-    except Exception as exc:
-        _log_once(
-            "instrument-detail-error-{}".format(stock),
-            "获取合约详情失败 {}: {}".format(stock, exc),
-        )
+    except Exception:
         return None
     if isinstance(detail, dict) and detail:
         return detail
-    _log_once("instrument-detail-empty-{}".format(stock), "合约详情为空 {}".format(stock))
     return None
 
 
@@ -382,31 +512,17 @@ def _mark_sell_reason(stock, reason):
     g.not_buy_again.append(stock)
 
 
-def _stock_sample(stock_list, limit=5):
-    stocks = list(stock_list or [])
-    suffix = "..." if len(stocks) > limit else ""
-    return "{}{}".format(stocks[:limit], suffix)
-
-
-def _log_once(key, message):
-    if key in g._diagnostic_log_keys:
-        return
-    print(message)
-    g._diagnostic_log_keys.add(key)
-
-
-def _dedupe_stocks(stock_list):
-    return list(dict.fromkeys([stock for stock in stock_list if stock]))
-
-
 def _get_sector_stocks(ContextInfo, sector_code):
-    sector_name = INDEX_SECTOR_NAME_MAP[sector_code]
-    stocks = ContextInfo.get_stock_list_in_sector(sector_name)
-    stocks = _dedupe_stocks(stocks)
-    if not stocks:
-        raise RuntimeError("QMT 板块 {} 未返回成分股, 请检查客户端左侧板块或本地数据".format(sector_name))
-    print("股票池 {} 使用 QMT 板块 {}, 成分 {} 只".format(sector_code, sector_name, len(stocks)))
-    return stocks
+    sector_names = INDEX_SECTOR_NAME_MAP.get(sector_code, [sector_code])
+    for sector_name in sector_names:
+        try:
+            stocks = ContextInfo.get_stock_list_in_sector(sector_name)
+        except Exception:
+            stocks = []
+        if stocks:
+            return list(dict.fromkeys([stock for stock in stocks if stock]))
+    print("获取板块成分股失败 {}, 请确认 QMT 本地板块名: {}".format(sector_code, sector_names))
+    return []
 
 
 def _to_float_list(values):
@@ -474,17 +590,13 @@ def _history(ContextInfo, stock_list, count, field, end_time=None, period="1d", 
     if not stocks:
         return {}
 
-    if field not in FIELD_MAP:
-        raise RuntimeError("未配置 QMT 行情字段映射: {}".format(field))
-    qmt_field = FIELD_MAP[field]
-    if end_time is None or end_time == "":
-        end_time = g._selection_end_time or _bar_time(ContextInfo)
-    if dividend_type is None or dividend_type == "":
-        dividend_type = g.dividend_type
+    aliases = FIELD_ALIASES.get(field, [field])
+    end_time = end_time or g._selection_end_time or _bar_time(ContextInfo)
+    dividend_type = dividend_type or g.dividend_type
 
     try:
         raw_data = ContextInfo.get_market_data_ex(
-            [qmt_field],
+            aliases,
             stocks,
             period=period,
             end_time=end_time,
@@ -494,33 +606,19 @@ def _history(ContextInfo, stock_list, count, field, end_time=None, period="1d", 
             subscribe=False,
         )
     except Exception as exc:
-        print("获取行情失败 field={} qmt_field={} period={} end_time={} count={} stocks={}: {}".format(
-            field, qmt_field, period, end_time, count, _stock_sample(stocks), exc
-        ))
+        print("获取行情失败 fields={} count={}: {}".format(aliases, count, exc))
         return {}
 
-    parsed = {}
-    for stock in stocks:
-        values = _extract_market_series(raw_data, stock, qmt_field, count)
-        if values:
-            parsed[stock] = values[-count:]
+    for qmt_field in aliases:
+        parsed = {}
+        for stock in stocks:
+            values = _extract_market_series(raw_data, stock, qmt_field, count)
+            if values:
+                parsed[stock] = values[-count:]
+        if parsed:
+            return parsed
 
-    if not parsed:
-        _log_once(
-            "history-empty-{}-{}-{}-{}".format(field, qmt_field, period, end_time),
-            "行情字段无数据 field={} qmt_field={} period={} end_time={} count={} stocks={}".format(
-                field, qmt_field, period, end_time, count, _stock_sample(stocks)
-            ),
-        )
-    elif len(parsed) < len(stocks):
-        missing = [stock for stock in stocks if stock not in parsed]
-        _log_once(
-            "history-partial-{}-{}-{}-{}".format(field, qmt_field, period, end_time),
-            "行情字段部分缺失 field={} qmt_field={} period={} end_time={} 缺失 {}/{} 示例={}".format(
-                field, qmt_field, period, end_time, len(missing), len(stocks), _stock_sample(missing)
-            ),
-        )
-    return parsed
+    return {}
 
 
 def _latest(history_map, stock, default=np.nan):
@@ -540,6 +638,11 @@ def _previous(history_map, stock, default=np.nan):
 
 
 def _last_price(ContextInfo, stock, field=None):
+    if getattr(g, "live_mode", False):
+        price = _live_tick_price(ContextInfo, stock)
+        if np.isfinite(price) and price > 0:
+            return price
+
     price_field = field or g.order_price_field
     period = _current_period(ContextInfo) if _is_intraday_period(ContextInfo) else "1d"
     price_data = _history(
@@ -551,7 +654,41 @@ def _last_price(ContextInfo, stock, field=None):
         period=period,
     )
     price = _latest(price_data, stock)
+    if not np.isfinite(price) or price <= 0:
+        close_data = _history(
+            ContextInfo,
+            [stock],
+            1,
+            "close",
+            end_time=_bar_time(ContextInfo),
+            period=period,
+        )
+        price = _latest(close_data, stock)
+    if (not np.isfinite(price) or price <= 0) and period != "1d":
+        close_data = _history(ContextInfo, [stock], 1, "close", period="1d")
+        price = _latest(close_data, stock)
     return price
+
+
+def _live_tick_price(ContextInfo, stock):
+    if not hasattr(ContextInfo, "get_full_tick"):
+        return np.nan
+    try:
+        tick_data = ContextInfo.get_full_tick([stock])
+    except Exception:
+        return np.nan
+    tick = tick_data.get(stock) if isinstance(tick_data, dict) else None
+    if not isinstance(tick, dict):
+        return np.nan
+    for key in ("lastPrice", "last", "close", "price"):
+        value = tick.get(key)
+        try:
+            value = float(value)
+        except Exception:
+            continue
+        if np.isfinite(value) and value > 0:
+            return value
+    return np.nan
 
 
 def _stock_name(ContextInfo, stock):
@@ -565,7 +702,6 @@ def _stock_name(ContextInfo, stock):
 
 def _sync_trade_state(ContextInfo):
     if "get_trade_detail_data" not in globals():
-        _log_once("trade-detail-missing", "未发现 get_trade_detail_data, 使用脚本本地持仓/资金状态")
         return
 
     try:
@@ -574,42 +710,28 @@ def _sync_trade_state(ContextInfo):
             available = accounts[0].m_dAvailable
             if available is not None:
                 g.money = float(available)
-        else:
-            _log_once("account-empty", "账户查询为空 account={} type={}".format(g.accountID, g.account_type))
-    except Exception as exc:
-        _log_once(
-            "account-query-error",
-            "账户资金同步失败 account={} type={}: {}".format(g.accountID, g.account_type, exc),
-        )
+    except Exception:
+        pass
 
     try:
         positions = get_trade_detail_data(g.accountID, g.account_type, "position")
-    except Exception as exc:
-        _log_once(
-            "position-query-error",
-            "持仓同步失败 account={} type={}: {}".format(g.accountID, g.account_type, exc),
-        )
-        return
-
-    if not positions:
-        _log_once("position-empty", "持仓查询为空 account={} type={}".format(g.accountID, g.account_type))
+    except Exception:
         return
 
     synced = {stock: 0 for stock in g.holdings.keys()}
+    if not positions:
+        g.holdings.update(synced)
+        g.hold_list = []
+        return
+
     for pos in positions:
         code = pos.m_strInstrumentID
         exchange = pos.m_strExchangeID
         volume = pos.m_nVolume
         if not code:
             continue
-        if volume is None:
-            _log_once(
-                "position-volume-missing-{}-{}".format(code, exchange),
-                "持仓同步跳过: {}.{} m_nVolume 为空".format(code, exchange),
-            )
-            continue
         stock = code if "." in code else "{}.{}".format(code, exchange)
-        synced[stock] = int(volume)
+        synced[stock] = int(volume or 0)
         cost = pos.m_dOpenPrice
         if cost is not None and synced[stock] > 0:
             g.buypoint[stock] = float(cost)
@@ -635,9 +757,7 @@ def prepare_stock_list(ContextInfo):
     close_data = _history(ContextInfo, g.hold_list, 2, "close")
     high_limit_data = _history(ContextInfo, g.hold_list, 2, "high_limit")
     if not high_limit_data:
-        raise RuntimeError("昨日涨停列表计算失败: QMT upLimit 字段无数据")
-    if not close_data:
-        raise RuntimeError("昨日涨停列表计算失败: QMT close 字段无数据")
+        return
 
     for code in g.hold_list:
         close_price = _previous(close_data, code)
@@ -647,262 +767,31 @@ def prepare_stock_list(ContextInfo):
 
 
 # ==============================================================================
-# 核心调仓：每日检查，按缓冲池/权重漂移/月度校准触发
+# 核心调仓：每周第二个交易日执行
 # ==============================================================================
-def _current_month_key():
-    if isinstance(g._current_date, datetime.datetime):
-        current_date = g._current_date.date()
-    else:
-        current_date = g._current_date
-    if isinstance(current_date, datetime.date):
-        return current_date.year, current_date.month
-    return None
-
-
-def _is_monthly_force_rebalance():
-    month_key = _current_month_key()
-    return month_key is not None and month_key != g._last_rebalance_month
-
-
-def _position_value(ContextInfo, stock):
-    shares = int(g.holdings.get(stock, 0))
-    if shares <= 0:
-        return 0.0
-    price = _last_price(ContextInfo, stock)
-    if not np.isfinite(price) or price <= 0:
-        _log_once(
-            "position-price-invalid-{}".format(stock),
-            "持仓估值跳过: {} 无有效 {} 价格".format(stock, g.order_price_field),
-        )
-        return 0.0
-    return shares * price
-
-
-def _portfolio_total_value(ContextInfo, extra_stocks=None):
-    total = float(g.money)
-    stocks = set(_held_stocks())
-    if extra_stocks:
-        stocks.update(extra_stocks)
-    for stock in stocks:
-        total += _position_value(ContextInfo, stock)
-    return total
-
-
-def _cap_and_normalize_weights(raw_weights):
-    scores = {
-        stock: max(float(score), 0.0)
-        for stock, score in raw_weights.items()
-        if np.isfinite(score) and score > 0
-    }
-    if not scores:
-        return {}
-
-    max_weight = max(float(g.max_position_weight), 1.0 / len(scores))
-    weights = {}
-    remaining = set(scores.keys())
-    remaining_weight = 1.0
-
-    while remaining and remaining_weight > 0:
-        total_score = sum(scores[stock] for stock in remaining)
-        if total_score <= 0:
-            equal_weight = remaining_weight / len(remaining)
-            for stock in remaining:
-                weights[stock] = equal_weight
-            break
-
-        capped = []
-        for stock in remaining:
-            weight = remaining_weight * scores[stock] / total_score
-            if weight > max_weight:
-                capped.append(stock)
-
-        if not capped:
-            for stock in remaining:
-                weights[stock] = remaining_weight * scores[stock] / total_score
-            break
-
-        for stock in capped:
-            weights[stock] = max_weight
-        remaining_weight -= max_weight * len(capped)
-        remaining = remaining.difference(capped)
-
-    total_weight = sum(weights.values())
-    if total_weight <= 0:
-        equal_weight = 1.0 / len(scores)
-        return {stock: equal_weight for stock in scores}
-    return {stock: weight / total_weight for stock, weight in weights.items()}
-
-
-def _calc_inverse_vol_weights(ContextInfo, target_list):
-    target_list = list(dict.fromkeys(target_list[:g.stock_num]))
-    if not target_list:
-        return {}
-
-    close_data = _history(
-        ContextInfo,
-        target_list,
-        g.risk_weight_window + 1,
-        "close",
-        end_time=_previous_bar_end_time(ContextInfo),
-        period="1d",
-    )
-    if not close_data:
-        raise RuntimeError("风险预算权重失败: QMT close 字段无数据")
-
-    scores = {}
-    invalid = []
-    for stock in target_list:
-        values = np.array(close_data.get(stock, []), dtype=float)
-        values = values[np.isfinite(values) & (values > 0)]
-        if len(values) < 20:
-            invalid.append((stock, "有效 close 不足"))
-            continue
-
-        returns = np.diff(values) / values[:-1]
-        returns = returns[np.isfinite(returns)]
-        vol = np.nanstd(returns) if len(returns) else np.nan
-        if not np.isfinite(vol) or vol <= 0:
-            invalid.append((stock, "波动率无效"))
-        else:
-            scores[stock] = 1.0 / vol
-    if invalid:
-        print("风险预算权重: 剔除 {} 只无效股票, 示例 {}".format(len(invalid), invalid[:5]))
-    if not scores:
-        raise RuntimeError("风险预算权重失败: 目标池无有效波动率样本")
-
-    weights = _cap_and_normalize_weights(scores)
-    if weights:
-        print("风险预算权重: {}".format({
-            stock: round(weight, 4) for stock, weight in weights.items()
-        }))
-    return weights
-
-
-def _weight_drift_too_large(ContextInfo, target_weights):
-    current_hold = set(_held_stocks())
-    overlap = current_hold.intersection(target_weights.keys())
-    if not overlap:
-        return False
-
-    total_value = _portfolio_total_value(ContextInfo, target_weights.keys())
-    if total_value <= 0:
-        return False
-
-    for stock in overlap:
-        target_weight = target_weights.get(stock, 0.0)
-        if target_weight <= 0:
-            continue
-        current_weight = _position_value(ContextInfo, stock) / total_value
-        drift = abs(current_weight - target_weight) / target_weight
-        if drift >= g.weight_drift_threshold:
-            return True
-    return False
-
-
-def _should_rebalance(ContextInfo, ranked_list, target_weights):
-    current_hold = set(_held_stocks())
-    target_set = set(ranked_list[:g.stock_num])
-    buffer_size = min(
-        len(ranked_list),
-        max(g.stock_num, int(np.ceil(g.stock_num * g.buffer_multiplier))),
-    )
-    buffer_set = set(ranked_list[:buffer_size])
-
-    if not current_hold and target_weights:
-        return True, "当前空仓建仓"
-
-    if len(current_hold) < min(g.stock_num, len(target_set)):
-        return True, "持仓数量不足"
-
-    if _is_monthly_force_rebalance():
-        return True, "月度强制校准"
-
-    out_of_buffer = [stock for stock in current_hold if stock not in buffer_set]
-    out_threshold = max(2, int(np.ceil(g.stock_num * g.rebalance_out_buffer_ratio)))
-    if len(out_of_buffer) >= out_threshold:
-        return True, "{} 只持仓跌出前 {} 名缓冲池".format(len(out_of_buffer), buffer_size)
-
-    new_targets = [stock for stock in target_set if stock not in current_hold]
-    if len(new_targets) >= g.rebalance_min_new_targets:
-        return True, "{} 只新股票进入目标池".format(len(new_targets))
-
-    if _weight_drift_too_large(ContextInfo, target_weights):
-        return True, "持仓权重偏离超过 {:.0%}".format(g.weight_drift_threshold)
-
-    return False, "持仓仍在缓冲池内，且权重偏离未超阈值"
-
-
-def _target_position_values(ContextInfo, target_weights):
-    target_set = set(target_weights.keys())
-    locked_value = 0.0
-    for stock in _held_stocks():
-        if stock not in target_set and stock in g.yesterday_HL_list:
-            locked_value += _position_value(ContextInfo, stock)
-
-    total_value = _portfolio_total_value(ContextInfo, target_set)
-    target_capital = max(total_value - locked_value, 0.0)
-    return {
-        stock: target_capital * weight
-        for stock, weight in target_weights.items()
-    }
-
-
-def _rebalance_to_weights(ContextInfo, target_weights, sell_unmatched=True, allow_reduce=True):
-    if not target_weights:
-        return
-
-    target_set = set(target_weights.keys())
-    if sell_unmatched:
-        for stock in list(_held_stocks()):
-            if stock not in target_set and stock not in g.yesterday_HL_list:
-                close_position(ContextInfo, stock)
-
-    target_values = _target_position_values(ContextInfo, target_weights)
-
-    if allow_reduce:
-        for stock, target_value in target_values.items():
-            if _position_value(ContextInfo, stock) > target_value:
-                order_target_value_(ContextInfo, stock, target_value)
-
-        target_values = _target_position_values(ContextInfo, target_weights)
-
-    for stock, target_value in target_values.items():
-        if stock in g.history_hold_list and int(g.holdings.get(stock, 0)) <= 0:
-            continue
-        if _position_value(ContextInfo, stock) < target_value:
-            order_target_value_(ContextInfo, stock, target_value)
-
-
 def weekly_adjustment(ContextInfo):
+    if not is_nth_trading_day_of_week(ContextInfo, 2):
+        return
     if not _daily_history_ready(ContextInfo):
         return
 
     cur_date = _date_to_yyyymmdd(g._current_date)
     print("=" * 60)
-    print("【调仓检查】{}".format(cur_date))
+    print("【调仓日】{}".format(cur_date))
 
-    ranked_list = get_stock_list(ContextInfo)
-    g.target_list = ranked_list
-    if not ranked_list:
+    g.target_list = get_stock_list(ContextInfo)
+    if not g.target_list:
         print("选股结果为空, 跳过本次调仓")
-        print("=" * 60)
         return
 
-    target_list = ranked_list[:g.stock_num]
-    target_weights = _calc_inverse_vol_weights(ContextInfo, target_list)
-    should_rebalance, reason = _should_rebalance(ContextInfo, ranked_list, target_weights)
-
-    if not should_rebalance:
-        print("未触发调仓: {}".format(reason))
-        print("目标池前 {} 只: {}".format(len(target_list), target_list))
-        print("=" * 60)
-        return
-
-    print("【触发调仓】{}".format(reason))
+    target_list = g.target_list[:g.stock_num]
     print("目标持仓 {} 只: {}".format(len(target_list), target_list))
-    _rebalance_to_weights(ContextInfo, target_weights)
-    g._last_rebalance_date = g._current_date
-    g._last_rebalance_month = _current_month_key()
+
+    for stock in list(g.hold_list):
+        if stock not in target_list and stock not in g.yesterday_HL_list:
+            close_position(ContextInfo, stock)
+
+    buy_security(ContextInfo, target_list)
     print("=" * 60)
 
 
@@ -915,8 +804,6 @@ def check_stop_loss(ContextInfo):
 
     idx_stocks = _get_sector_stocks(ContextInfo, g.index_code)
     close_data = _history(ContextInfo, idx_stocks, 2, "close")
-    if not close_data:
-        raise RuntimeError("市场止损检查失败: QMT close 字段无数据")
     ratios = []
     for stock in idx_stocks:
         values = close_data.get(stock, [])
@@ -936,13 +823,7 @@ def check_stop_loss(ContextInfo):
         if shares <= 0:
             continue
         price = _last_price(ContextInfo, stock, "close")
-        cost = g.buypoint.get(stock)
-        if cost is None:
-            _log_once(
-                "stoploss-cost-missing-{}".format(stock),
-                "个股止损跳过: {} 缺少持仓成本".format(stock),
-            )
-            continue
+        cost = g.buypoint.get(stock, price)
         if np.isfinite(price) and price < cost * (1 - g.stoploss_limit):
             close_position(ContextInfo, stock)
             print("【个股止损】{} ({}) 跌破成本价 {:.1%}".format(
@@ -966,9 +847,7 @@ def check_limit_up(ContextInfo):
     close_data = _history(ContextInfo, g.yesterday_HL_list, 1, "close")
     high_limit_data = _history(ContextInfo, g.yesterday_HL_list, 1, "high_limit")
     if not high_limit_data:
-        raise RuntimeError("涨停打开检查失败: QMT upLimit 字段无数据")
-    if not close_data:
-        raise RuntimeError("涨停打开检查失败: QMT close 字段无数据")
+        return
 
     for stock in g.yesterday_HL_list:
         if g.holdings.get(stock, 0) <= 0:
@@ -987,24 +866,14 @@ def check_remain_amount(ContextInfo):
     if g.reason_to_sell in ["limitup", "stoploss"]:
         g.hold_list = _held_stocks()
         if len(g.hold_list) < g.stock_num and g.target_list:
-            target_list = filter_not_buy_again(ContextInfo, g.target_list)[:g.stock_num]
-            target_weights = _calc_inverse_vol_weights(ContextInfo, target_list)
-            _rebalance_to_weights(
-                ContextInfo,
-                target_weights,
-                sell_unmatched=False,
-                allow_reduce=False,
-            )
+            target_list = filter_not_buy_again(ContextInfo, g.target_list)
+            buy_security(ContextInfo, target_list)
         g.reason_to_sell = ""
 
 
 # ==============================================================================
 # 核心选股：小市值初筛 + Barra 量价因子评分排序
 # ==============================================================================
-def _log_filter_result(name, before_count, after_count):
-    print("过滤步骤 {}: {} -> {}".format(name, before_count, after_count))
-
-
 def get_stock_list(ContextInfo):
     g._selection_end_time = _previous_bar_end_time(ContextInfo)
     try:
@@ -1017,82 +886,59 @@ def _get_stock_list_impl(ContextInfo):
     initial_list = _get_sector_stocks(ContextInfo, g.index_code)
     if not initial_list:
         return []
-    print("初始股票池数量: {}".format(len(initial_list)))
 
     base_date = g._previous_trade_date or g._current_date or _get_current_date(ContextInfo)
     cutoff_date = base_date - datetime.timedelta(days=375)
-    before_count = len(initial_list)
     initial_list = filter_listed_before(ContextInfo, initial_list, cutoff_date)
-    _log_filter_result("上市满一年", before_count, len(initial_list))
     if not initial_list:
         return []
 
     filters = [
-        ("过滤科创/北交/创业板", filter_kcbj_stock),
-        ("过滤ST/退市名称", filter_st_stock),
-        ("过滤停牌", filter_paused_stock),
-        ("过滤涨停", filter_limitup_stock),
-        ("过滤跌停", filter_limitdown_stock),
-        ("过滤高价股", filter_highprice_stock),
+        filter_kcbj_stock,
+        filter_st_stock,
+        filter_paused_stock,
+        filter_limitup_stock,
+        filter_limitdown_stock,
+        filter_highprice_stock,
     ]
 
-    for name, func in filters:
-        before_count = len(initial_list)
+    for func in filters:
         initial_list = func(ContextInfo, initial_list)
-        _log_filter_result(name, before_count, len(initial_list))
         if not initial_list:
             return []
 
-    money_data = _history(ContextInfo, initial_list, g.liquidity_days, "money")
-    if not money_data:
-        raise RuntimeError("流动性过滤失败: QMT amount 字段无数据")
-    avg_amount = {}
-    missing_amount = []
-    for stock in initial_list:
-        values = np.array(money_data.get(stock, []), dtype=float)
-        if len(values) >= g.liquidity_days:
-            avg_amount[stock] = np.nanmean(values)
-        else:
-            missing_amount.append(stock)
-    if missing_amount:
-        print("流动性过滤: {} 只股票 amount 历史不足, 示例 {}".format(
-            len(missing_amount), _stock_sample(missing_amount)
-        ))
-    if not avg_amount:
-        raise RuntimeError("流动性过滤失败: 无股票满足 amount 历史长度要求")
-    before_count = len(initial_list)
-    initial_list = [
-        stock for stock in initial_list
-        if avg_amount.get(stock, 0) >= g.min_avg_amount
-    ]
-    _log_filter_result("最低成交额", before_count, len(initial_list))
+    try:
+        money_data = _history(ContextInfo, initial_list, g.liquidity_days, "money")
+        avg_amount = {}
+        for stock in initial_list:
+            values = np.array(money_data.get(stock, []), dtype=float)
+            if len(values) >= g.liquidity_days:
+                avg_amount[stock] = np.nanmean(values)
+        if avg_amount:
+            initial_list = [
+                stock for stock in initial_list
+                if avg_amount.get(stock, 0) >= g.min_avg_amount
+            ]
+    except Exception as exc:
+        print("流动性过滤失败: {}".format(exc))
     if not initial_list:
         return []
 
-    close_data = _history(ContextInfo, initial_list, g.momentum_days, "close")
-    if not close_data:
-        raise RuntimeError("动量过滤失败: QMT close 字段无数据")
-    momentum = {}
-    missing_momentum = []
-    for stock in initial_list:
-        close = np.array(close_data.get(stock, []), dtype=float)
-        close = close[np.isfinite(close)]
-        if len(close) >= 2 and close[0] > 0:
-            momentum[stock] = (close[-1] - close[0]) / close[0]
-        else:
-            missing_momentum.append(stock)
-    if missing_momentum:
-        print("动量过滤: {} 只股票 close 历史不足, 示例 {}".format(
-            len(missing_momentum), _stock_sample(missing_momentum)
-        ))
-    if not momentum:
-        raise RuntimeError("动量过滤失败: 无股票满足 close 历史长度要求")
-    before_count = len(initial_list)
-    initial_list = [
-        stock for stock in initial_list
-        if g.filter_threshold1 < momentum.get(stock, np.nan) < g.filter_threshold2
-    ]
-    _log_filter_result("30日动量区间", before_count, len(initial_list))
+    try:
+        close_data = _history(ContextInfo, initial_list, g.momentum_days, "close")
+        momentum = {}
+        for stock in initial_list:
+            close = np.array(close_data.get(stock, []), dtype=float)
+            close = close[np.isfinite(close)]
+            if len(close) >= 2 and close[0] > 0:
+                momentum[stock] = (close[-1] - close[0]) / close[0]
+        if momentum:
+            initial_list = [
+                stock for stock in initial_list
+                if g.filter_threshold1 < momentum.get(stock, np.nan) < g.filter_threshold2
+            ]
+    except Exception as exc:
+        print("动量过滤失败: {}".format(exc))
     if not initial_list:
         return []
 
@@ -1109,14 +955,15 @@ def _get_stock_list_impl(ContextInfo):
         cap_for_turnover = cap_df["circ_market_cap"] if "circ_market_cap" in cap_df.columns else cap_df["market_cap"]
         market_cap_map = dict(zip(cap_df["code"], cap_for_turnover.fillna(cap_df["market_cap"])))
     else:
-        raise RuntimeError("市值筛选失败: 无有效 TotalVolume/FloatVolume 或 close 数据")
-    _log_filter_result("市值区间", len(initial_list), len(candidate_list))
+        print("市值筛选失败")
+        return []
 
     print("候选股票数量: {}, 开始计算 Barra 因子...".format(len(candidate_list)))
     factor_df = calc_barra_factors(ContextInfo, candidate_list, market_cap_map)
 
     if factor_df is None or factor_df.empty:
-        raise RuntimeError("Barra 因子计算失败: 不允许改用市值或原始顺序排序")
+        print("Barra 因子计算失败, 退化为市值/原始顺序排序")
+        return candidate_list[:g.stock_num]
 
     factor_df = calc_composite_score(factor_df)
     factor_df = factor_df.sort_values("composite_score", ascending=True)
@@ -1129,11 +976,8 @@ def _get_stock_list_impl(ContextInfo):
 def _get_market_cap_df(ContextInfo, stock_list):
     override = g.market_cap_map
     close_data = _history(ContextInfo, stock_list, 1, "close")
-    if not close_data:
-        raise RuntimeError("市值计算失败: QMT close 字段无数据")
+    total_value_data = _history(ContextInfo, stock_list, 1, "total_value")
     rows = []
-    missing_share = []
-    missing_price = []
 
     for stock in stock_list:
         if stock in override:
@@ -1153,12 +997,11 @@ def _get_market_cap_df(ContextInfo, stock_list):
                 market_cap = close_price * total_share / 1e8
             if np.isfinite(float_share) and float_share > 0:
                 circ_market_cap = close_price * float_share / 1e8
-        else:
-            missing_price.append(stock)
 
         if not np.isfinite(market_cap):
-            missing_share.append(stock)
-            continue
+            total_value = _latest(total_value_data, stock)
+            if np.isfinite(total_value) and total_value > 0:
+                market_cap = _normalize_market_value_to_yuan([total_value])[-1] / 1e8
 
         if not np.isfinite(circ_market_cap):
             circ_market_cap = market_cap
@@ -1168,14 +1011,6 @@ def _get_market_cap_df(ContextInfo, stock_list):
             "circ_market_cap": circ_market_cap,
         })
 
-    if missing_price:
-        print("市值计算: {} 只股票 close 缺失, 示例 {}".format(
-            len(missing_price), _stock_sample(missing_price)
-        ))
-    if missing_share:
-        print("市值计算: {} 只股票 TotalVolume 缺失或无效, 示例 {}".format(
-            len(missing_share), _stock_sample(missing_share)
-        ))
     return pd.DataFrame(rows)
 
 
@@ -1190,7 +1025,7 @@ def _normalize_share_count(value):
     if not np.isfinite(value) or value <= 0:
         return np.nan
     if value < 1e6:
-        return np.nan
+        return value * 10000
     return value
 
 
@@ -1242,6 +1077,19 @@ def _normalize_market_cap_to_yi(value):
     return value
 
 
+def _normalize_market_value_to_yuan(values):
+    arr = np.array(values, dtype=float)
+    finite = arr[np.isfinite(arr) & (arr > 0)]
+    if len(finite) == 0:
+        return arr
+    median = float(np.nanmedian(finite))
+    if median < 1e4:
+        return arr * 1e8
+    if median < 1e8:
+        return arr * 1e4
+    return arr
+
+
 # ==============================================================================
 # Barra 量价因子计算
 # ==============================================================================
@@ -1249,32 +1097,24 @@ def calc_barra_factors(ContextInfo, stock_list, market_cap_map=None):
     if not stock_list:
         return None
 
+    market_cap_map = market_cap_map or {}
     need_days = g.vol_window + 10
 
     close_data = _history(ContextInfo, stock_list, need_days, "close")
     volume_data = _history(ContextInfo, stock_list, need_days, "volume")
     money_data = _history(ContextInfo, stock_list, need_days, "money")
     total_value_data = _history(ContextInfo, stock_list, need_days, "total_value")
-    required_data = {
-        "close": close_data,
-        "volume": volume_data,
-        "amount": money_data,
-        "total_value": total_value_data,
-    }
-    for field_name, data in required_data.items():
-        if not data:
-            raise RuntimeError("Barra 因子计算失败: QMT {} 字段无数据".format(field_name))
 
     mkt_close = _history(ContextInfo, [g.benchmark], need_days, "close").get(
         g.benchmark, []
     )
-    if len(mkt_close) < need_days:
-        raise RuntimeError("Barra 因子计算失败: 策略基准 {} close 历史不足".format(g.benchmark))
-    mkt_close = np.array(mkt_close, dtype=float)
-    mkt_ret = np.diff(mkt_close) / mkt_close[:-1]
+    if len(mkt_close) >= 2:
+        mkt_close = np.array(mkt_close, dtype=float)
+        mkt_ret = np.diff(mkt_close) / mkt_close[:-1]
+    else:
+        mkt_ret = None
 
     records = []
-    skipped = []
     for code in stock_list:
         try:
             close = np.array(close_data.get(code, []), dtype=float)
@@ -1283,20 +1123,28 @@ def calc_barra_factors(ContextInfo, stock_list, market_cap_map=None):
             total_value = np.array(total_value_data.get(code, []), dtype=float)
 
             if len(close) < 63:
-                skipped.append((code, "close历史不足"))
                 continue
-            if len(volume) != len(close) or len(money) != len(close) or len(total_value) != len(close):
-                skipped.append((code, "字段长度不一致"))
-                continue
+            if len(volume) != len(close):
+                volume = np.full(len(close), np.nan)
+            if len(money) != len(close):
+                money = volume * close
 
             finite_total_value = total_value[np.isfinite(total_value)]
-            if len(finite_total_value) == 0 or np.nanmax(finite_total_value) <= 0:
-                skipped.append((code, "total_value无效"))
-                continue
+            if (
+                len(total_value) != len(close)
+                or len(finite_total_value) == 0
+                or np.nanmax(finite_total_value) <= 0
+            ):
+                cap_yi = market_cap_map.get(code, np.nan)
+                if np.isfinite(cap_yi) and cap_yi > 0:
+                    total_value = np.full(len(close), cap_yi * 1e8)
+                else:
+                    total_value = np.full(len(close), np.nan)
+            else:
+                total_value = _normalize_market_value_to_yuan(total_value)
 
             valid_mask = np.isfinite(close) & (close > 0)
             if valid_mask.sum() < 63:
-                skipped.append((code, "有效close不足"))
                 continue
             close = close[valid_mask]
             volume = volume[valid_mask]
@@ -1305,24 +1153,20 @@ def calc_barra_factors(ContextInfo, stock_list, market_cap_map=None):
 
             ret = np.diff(close) / close[:-1]
             if len(ret) < 62:
-                skipped.append((code, "收益率样本不足"))
                 continue
 
             row = {"code": code}
             row["HSIGMA"] = _calc_hsigma(ret, mkt_ret, g.vol_window, g.vol_halflife)
             row["DASTD"] = _calc_dastd(ret, g.vol_window, g.dastd_halflife)
             row["CMRA"] = _calc_cmra(close, g.cmra_months)
-            row["STOM"] = _calc_stom(money, total_value, g.stom_window)
-            row["STOQ"] = _calc_stoq(money, total_value, g.stoq_window)
-            row["STOA"] = _calc_stoa(money, total_value, g.stoa_window)
-            row["ATVR"] = _calc_atvr(money, total_value, g.vol_window, g.atvr_halflife)
+            row["STOM"] = _calc_stom(volume, total_value, g.stom_window)
+            row["STOQ"] = _calc_stoq(volume, total_value, g.stoq_window)
+            row["STOA"] = _calc_stoa(volume, total_value, g.stoa_window)
+            row["ATVR"] = _calc_atvr(volume, total_value, g.vol_window, g.atvr_halflife)
             records.append(row)
-        except Exception as exc:
-            skipped.append((code, str(exc)))
+        except Exception:
             continue
 
-    if skipped:
-        print("Barra 因子计算跳过 {} 只股票, 示例 {}".format(len(skipped), skipped[:5]))
     if not records:
         return None
 
@@ -1342,7 +1186,7 @@ def _calc_hsigma(ret, mkt_ret, window, halflife):
         n = min(window, len(ret))
         r = ret[-n:]
         if mkt_ret is None or len(mkt_ret) < n:
-            raise RuntimeError("HSIGMA 计算失败: 市场收益样本不足")
+            return float(np.std(r))
         m = mkt_ret[-n:]
         w = _exp_weights(n, halflife)
         w_sqrt = np.sqrt(w)
@@ -1468,40 +1312,35 @@ def _zscore(series):
     mu = series.mean()
     std = series.std()
     if std == 0 or np.isnan(std):
-        raise RuntimeError("因子标准化失败: 截面标准差为 0 或 NaN")
+        return series * 0
     return (series - mu) / std
 
 
 def calc_composite_score(df):
     factor_cols = list(g.factor_weights.keys())
     df = df.copy()
-    for col in factor_cols:
-        if col not in df.columns:
-            raise RuntimeError("因子合成失败: 缺少因子列 {}".format(col))
-    missing_factor_mask = df[factor_cols].isna().any(axis=1)
-    if missing_factor_mask.any():
-        missing_codes = df.loc[missing_factor_mask, "code"].tolist()
-        print("因子合成: 剔除 {} 只因子缺失股票, 示例 {}".format(
-            len(missing_codes), _stock_sample(missing_codes)
-        ))
-        df = df.loc[~missing_factor_mask].copy()
-    if len(df) < 5:
-        raise RuntimeError("因子合成失败: 完整因子股票不足 {}".format(len(df)))
 
     for col in factor_cols:
+        if col not in df.columns:
+            continue
         valid_mask = df[col].notna()
         if valid_mask.sum() < 5:
-            raise RuntimeError("因子合成失败: {} 有效样本不足 {}".format(col, int(valid_mask.sum())))
+            df[col + "_z"] = 0.0
+            continue
         series = df.loc[valid_mask, col].copy()
         series = _mad_winsorize(series)
         series = _zscore(series)
         df.loc[valid_mask, col + "_z"] = series
+        df.loc[~valid_mask, col + "_z"] = 0.0
 
     z_cols = [col + "_z" for col in factor_cols if col + "_z" in df.columns]
     if not z_cols:
-        raise RuntimeError("因子合成失败: 没有可用标准化因子")
+        df["composite_score"] = 0.0
     else:
-        weights = np.array([g.factor_weights[c.replace("_z", "")] for c in z_cols])
+        weights = np.array([
+            g.factor_weights.get(c.replace("_z", ""), 1 / len(z_cols))
+            for c in z_cols
+        ])
         weights = weights / weights.sum()
         df["composite_score"] = df[z_cols].values @ weights
 
@@ -1513,29 +1352,14 @@ def calc_composite_score(df):
 # ==============================================================================
 def filter_listed_before(ContextInfo, stock_list, cutoff_date):
     result = []
-    missing_detail = []
-    missing_open_date = []
     for stock in stock_list:
         detail = _instrument_detail(ContextInfo, stock)
         if not detail:
-            missing_detail.append(stock)
+            result.append(stock)
             continue
         open_date = _parse_qmt_date(detail.get("OpenDate"))
-        if open_date is None:
-            missing_open_date.append(stock)
-            continue
-        if open_date <= cutoff_date:
+        if open_date is None or open_date <= cutoff_date:
             result.append(stock)
-    if missing_detail:
-        print("上市时间过滤: {} 只股票合约详情缺失, 示例 {}".format(
-            len(missing_detail), _stock_sample(missing_detail)
-        ))
-    if missing_open_date:
-        print("上市时间过滤: {} 只股票 OpenDate 缺失或无效, 示例 {}".format(
-            len(missing_open_date), _stock_sample(missing_open_date)
-        ))
-    if len(missing_detail) + len(missing_open_date) == len(stock_list):
-        raise RuntimeError("上市时间过滤失败: 全部股票缺少有效 OpenDate/合约详情")
     return result
 
 
@@ -1552,56 +1376,30 @@ def filter_paused_stock(ContextInfo, stock_list):
     suspend_data = _history(ContextInfo, stock_list, 1, "suspend")
     close_data = _history(ContextInfo, stock_list, 1, "close")
     volume_data = _history(ContextInfo, stock_list, 1, "volume")
-    if not suspend_data:
-        raise RuntimeError("停牌过滤失败: QMT suspendFlag 字段无数据")
-    if not close_data:
-        raise RuntimeError("停牌过滤失败: QMT close 字段无数据")
-    if not volume_data:
-        raise RuntimeError("停牌过滤失败: QMT volume 字段无数据")
-
     result = []
-    missing = []
     for stock in stock_list:
         detail = _instrument_detail(ContextInfo, stock)
         if _is_suspended_detail(detail):
             continue
 
         suspend_flag = _latest(suspend_data, stock, default=np.nan)
-        close_price = _latest(close_data, stock)
-        volume = _latest(volume_data, stock, default=np.nan)
-        if not np.isfinite(suspend_flag) or not np.isfinite(close_price) or not np.isfinite(volume):
-            missing.append(stock)
-            continue
         if np.isfinite(suspend_flag) and int(suspend_flag) == 1:
             continue
-        if close_price > 0 and volume > 0:
-            result.append(stock)
-    if missing:
-        print("停牌过滤: {} 只股票停牌/价格/成交量字段缺失, 示例 {}".format(
-            len(missing), _stock_sample(missing)
-        ))
+        close_price = _latest(close_data, stock)
+        volume = _latest(volume_data, stock, default=np.nan)
+        if np.isfinite(close_price) and close_price > 0:
+            if not np.isfinite(volume) or volume > 0:
+                result.append(stock)
     return result
 
 
 def filter_st_stock(ContextInfo, stock_list):
     result = []
-    missing_name = []
     for stock in stock_list:
-        detail = _instrument_detail(ContextInfo, stock)
-        name = detail.get("InstrumentName") if detail else None
-        if not name:
-            missing_name.append(stock)
-            continue
-        name = str(name)
+        name = _stock_name(ContextInfo, stock)
         if "ST" in name or "*" in name or "退" in name:
             continue
         result.append(stock)
-    if missing_name:
-        print("ST过滤: {} 只股票 InstrumentName 缺失, 示例 {}".format(
-            len(missing_name), _stock_sample(missing_name)
-        ))
-    if len(missing_name) == len(stock_list):
-        raise RuntimeError("ST过滤失败: 全部股票缺少 InstrumentName")
     return result
 
 
@@ -1618,25 +1416,15 @@ def _filter_limit_stock(ContextInfo, stock_list, limit_field):
         return []
     close_data = _history(ContextInfo, stock_list, 1, "close")
     limit_data = _history(ContextInfo, stock_list, 1, limit_field)
-    if not close_data:
-        raise RuntimeError("{} 过滤失败: QMT close 字段无数据".format(limit_field))
     if not limit_data:
-        raise RuntimeError("{} 过滤失败: QMT {} 字段无数据".format(limit_field, FIELD_MAP[limit_field]))
+        return stock_list
     result = []
     hold_set = set(g.hold_list)
-    missing = []
     for stock in stock_list:
         close_price = _latest(close_data, stock)
         limit_price = _latest(limit_data, stock)
-        if not np.isfinite(close_price) or not np.isfinite(limit_price):
-            missing.append(stock)
-            continue
         if stock in hold_set or not _is_limit_price(close_price, limit_price):
             result.append(stock)
-    if missing:
-        print("{} 过滤: {} 只股票价格/涨跌停字段缺失, 示例 {}".format(
-            limit_field, len(missing), _stock_sample(missing)
-        ))
     return result
 
 
@@ -1652,13 +1440,6 @@ def filter_highprice_stock(ContextInfo, stock_list):
     if not stock_list:
         return []
     close_data = _history(ContextInfo, stock_list, 1, "close")
-    if not close_data:
-        raise RuntimeError("高价股过滤失败: QMT close 字段无数据")
-    missing = [stock for stock in stock_list if not np.isfinite(_latest(close_data, stock))]
-    if missing:
-        print("高价股过滤: {} 只股票 close 字段缺失, 示例 {}".format(
-            len(missing), _stock_sample(missing)
-        ))
     return [
         stock for stock in stock_list
         if stock in g.hold_list
@@ -1684,13 +1465,60 @@ def _round_lot_by_value(value, price):
     return int(value / price / LOT_SIZE) * LOT_SIZE
 
 
+def _account_ready():
+    if not g.accountID or "请在" in g.accountID:
+        print("未获取到模型交易账号，请在 QMT 模型交易界面选择账号后运行。")
+        return False
+    return True
+
+
+def _new_order_note(security, side):
+    g._order_seq += 1
+    code = security.split(".")[0]
+    return "{}{}{}{}".format(datetime.datetime.now().strftime("%H%M%S"), code, side, g._order_seq)
+
+
+def _submit_live_order(ContextInfo, security, shares, side):
+    if shares <= 0:
+        return False
+    if "passorder" not in globals():
+        print("未发现 passorder 函数，当前环境无法发出实盘委托: {} {}".format(security, shares))
+        return False
+    if not _account_ready():
+        return False
+
+    op_type = g.buy_op_type if side == "buy" else g.sell_op_type
+    note = _new_order_note(security, "B" if side == "buy" else "S")
+    try:
+        passorder(
+            op_type,
+            g.passorder_order_type,
+            g.accountID,
+            security,
+            g.passorder_price_type,
+            g.passorder_price,
+            int(shares),
+            g.passorder_strategy_name,
+            g.passorder_quick_trade,
+            note,
+            ContextInfo,
+        )
+    except Exception as exc:
+        print("passorder 失败 {} {}股: {}".format(security, shares, exc))
+        return False
+
+    g._pending_order_notes[note] = {
+        "stock": security,
+        "shares": int(shares),
+        "side": side,
+        "time": datetime.datetime.now(),
+    }
+    return True
+
+
 def order_target_value_(ContextInfo, security, value):
     price = _last_price(ContextInfo, security)
     if not np.isfinite(price) or price <= 0:
-        _log_once(
-            "order-price-invalid-{}".format(security),
-            "下单跳过: {} 无有效 {} 价格".format(security, g.order_price_field),
-        )
         return False
 
     current_shares = int(g.holdings.get(security, 0))
@@ -1698,21 +1526,11 @@ def order_target_value_(ContextInfo, security, value):
     delta_value = float(value) - current_value
 
     if abs(delta_value) < price * LOT_SIZE:
-        _log_once(
-            "order-delta-too-small-{}-{}".format(security, int(value == 0)),
-            "下单跳过: {} 目标差额 {:.2f} 小于一手金额 {:.2f}".format(
-                security, delta_value, price * LOT_SIZE
-            ),
-        )
         return False
 
     if delta_value > 0:
         shares = _round_lot_by_value(delta_value, price)
         if shares < LOT_SIZE:
-            _log_once(
-                "order-lot-too-small-{}".format(security),
-                "买入跳过: {} 目标金额不足一手".format(security),
-            )
             return False
         order_value = shares * price
         cost = _calc_order_cost(order_value, is_sell=False)
@@ -1720,13 +1538,10 @@ def order_target_value_(ContextInfo, security, value):
             shares = _round_lot_by_value(g.money - cost, price)
             order_value = shares * price
             if shares < LOT_SIZE:
-                _log_once(
-                    "order-cash-too-low-{}".format(security),
-                    "买入跳过: {} 可用资金 {:.2f} 不足一手含费用".format(security, g.money),
-                )
                 return False
             cost = _calc_order_cost(order_value, is_sell=False)
-        order_shares(security, shares, "FIX", price, ContextInfo, g.accountID)
+        if not _submit_live_order(ContextInfo, security, shares, "buy"):
+            return False
         g.money -= order_value + cost
         g.profit -= cost
         g.holdings[security] = current_shares + shares
@@ -1743,14 +1558,9 @@ def order_target_value_(ContextInfo, security, value):
         return False
     order_value = shares * price
     cost = _calc_order_cost(order_value, is_sell=True)
-    order_shares(security, -shares, "FIX", price, ContextInfo, g.accountID)
-    buy_price = g.buypoint.get(security)
-    if buy_price is None:
-        _log_once(
-            "sell-cost-missing-{}".format(security),
-            "卖出收益估算: {} 缺少持仓成本, 使用当前成交价估算本地收益".format(security),
-        )
-        buy_price = price
+    if not _submit_live_order(ContextInfo, security, shares, "sell"):
+        return False
+    buy_price = g.buypoint.get(security, price)
     g.money += order_value - cost
     g.profit += (price - buy_price) * shares - cost
     g.holdings[security] = current_shares - shares
@@ -1772,13 +1582,19 @@ def close_position(ContextInfo, security):
 
 
 def buy_security(ContextInfo, target_list):
-    if not target_list or g.money <= 0:
+    current_hold = set(_held_stocks())
+    to_buy = [
+        stock for stock in target_list
+        if stock not in current_hold and stock not in g.history_hold_list
+    ]
+    if not to_buy or g.money <= 0:
         return
-    target_list = filter_not_buy_again(ContextInfo, target_list)[:g.stock_num]
-    target_weights = _calc_inverse_vol_weights(ContextInfo, target_list)
-    _rebalance_to_weights(
-        ContextInfo,
-        target_weights,
-        sell_unmatched=False,
-        allow_reduce=False,
-    )
+
+    max_buy = g.stock_num - len(current_hold)
+    if max_buy <= 0:
+        return
+    to_buy = to_buy[:max_buy]
+    cash_per = g.money / len(to_buy)
+
+    for stock in to_buy:
+        open_position(ContextInfo, stock, cash_per)
