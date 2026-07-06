@@ -1,4 +1,4 @@
-# coding:utf-8
+#coding:gbk
 """
 QMT 转换版：低波动小市值
 
@@ -8,7 +8,6 @@ init(ContextInfo) 初始化，handlebar(ContextInfo) 在日线 bar 中执行每�
 """
 
 import datetime
-from datetime import timedelta
 
 import numpy as np
 import pandas as pd
@@ -19,6 +18,12 @@ class G:
 
 
 g = G()
+
+LOT_SIZE = 100
+TRADING_DAYS_PER_MONTH = 21
+LIMIT_PRICE_MIN_DIFF = 0.01
+LIMIT_PRICE_REL_DIFF = 0.0001
+FACTOR_NAMES = ("HSIGMA", "DASTD", "CMRA", "STOM", "STOQ", "STOA", "ATVR")
 
 
 FIELD_ALIASES = {
@@ -50,9 +55,8 @@ INDEX_SECTOR_NAME_MAP = {
 
 def init(ContextInfo):
     # -------- 标的与账户 --------
-    g.benchmark = "000300.SH"
+    g.benchmark = ContextInfo.benchmark
     g.index_code = "399101.SZ"
-    g.index_sector_names = INDEX_SECTOR_NAME_MAP.get(g.index_code, [g.index_code])
     g.accountID = "testS"
 
     # -------- 策略核心参数 --------
@@ -72,6 +76,10 @@ def init(ContextInfo):
     g.liquidity_days = 20
     g.min_avg_amount = 5e7
 
+    # -------- 市值过滤参数（单位：亿元）--------
+    g.min_market_cap = 5
+    g.max_market_cap = 50
+
     # -------- Barra 因子参数 --------
     g.vol_window = 252
     g.vol_halflife = 63
@@ -82,20 +90,11 @@ def init(ContextInfo):
     g.stoa_window = 252
     g.atvr_halflife = 63
 
-    g.factor_weights = {
-        "HSIGMA": 1 / 7,
-        "DASTD": 1 / 7,
-        "CMRA": 1 / 7,
-        "STOM": 1 / 7,
-        "STOQ": 1 / 7,
-        "STOA": 1 / 7,
-        "ATVR": 1 / 7,
-    }
+    g.factor_weights = {name: 1 / len(FACTOR_NAMES) for name in FACTOR_NAMES}
 
     # -------- QMT 回测状态 --------
     g.s = _get_sector_stocks(ContextInfo, g.index_code)
-    if g.s:
-        ContextInfo.set_universe(g.s)
+    print("策略初始化: 市场整体标的 {}, 指数池 {} 只".format(g.benchmark, len(g.s)))
 
     g.holdings = {stock: 0 for stock in g.s}
     g.buypoint = {}
@@ -105,10 +104,12 @@ def init(ContextInfo):
     g.not_buy_again = []
     g.history_hold_list = []
     g.reason_to_sell = ""
+    g.market_cap_map = {}
 
-    capital = getattr(ContextInfo, "capital", 1000000)
-    g.money = float(capital)
+    g.initial_cash = float(ContextInfo.capital)
+    g.money = float(g.initial_cash)
     g.profit = 0.0
+    g.profit_ratio = 0.0
     g.commission_rate = 2.5 / 10000
     g.close_tax_rate = 0.001
     g.min_commission = 5.0
@@ -120,6 +121,7 @@ def init(ContextInfo):
     g._current_date = None
     g._previous_trade_date = None
     g._last_processed_bar = None
+    g._selection_end_time = None
 
     print("策略初始化完成, 指数池数量: {}, 因子权重: {}".format(
         len(g.s), {k: round(v, 3) for k, v in g.factor_weights.items()}
@@ -127,15 +129,15 @@ def init(ContextInfo):
 
 
 def handlebar(ContextInfo):
-    if hasattr(ContextInfo, "is_new_bar") and not ContextInfo.is_new_bar():
+    if not ContextInfo.is_new_bar():
         return
 
     _update_calendar_state(ContextInfo)
 
-    d = getattr(ContextInfo, "barpos", 0)
-    if d < getattr(g, "min_bars", 260):
+    d = ContextInfo.barpos
+    if d < g.min_bars:
         return
-    if getattr(g, "_last_processed_bar", None) == d:
+    if g._last_processed_bar == d:
         return
 
     g._last_processed_bar = d
@@ -144,17 +146,14 @@ def handlebar(ContextInfo):
     check_stop_loss(ContextInfo)
     trade_afternoon(ContextInfo)
 
-    capital = float(getattr(ContextInfo, "capital", 1) or 1)
-    profit_ratio = g.profit / capital
-    if not getattr(ContextInfo, "do_back_test", True):
-        ContextInfo.paint("profit_ratio", profit_ratio, -1, 0)
+    g.profit_ratio = g.profit / float(g.initial_cash or 1)
 
 
 # ==============================================================================
 # 日历与 QMT 兼容工具
 # ==============================================================================
 def _get_current_date(ContextInfo):
-    barpos = getattr(ContextInfo, "barpos", 0)
+    barpos = ContextInfo.barpos
     try:
         tag = ContextInfo.get_bar_timetag(barpos)
         date_text = timetag_to_datetime(tag, "%Y%m%d")
@@ -174,16 +173,21 @@ def _bar_time(ContextInfo, fmt="%Y%m%d%H%M%S"):
         return ""
 
 
+def _previous_bar_end_time(ContextInfo):
+    trade_date = g._previous_trade_date or _get_current_date(ContextInfo)
+    return _date_to_yyyymmdd(trade_date) + "150000"
+
+
 def _update_calendar_state(ContextInfo):
     current_date = _get_current_date(ContextInfo)
-    if getattr(g, "_current_date", None) == current_date:
+    if g._current_date == current_date:
         return
 
-    g._previous_trade_date = getattr(g, "_current_date", None)
+    g._previous_trade_date = g._current_date
     g._current_date = current_date
     week_key = current_date.isocalendar()[:2]
 
-    if getattr(g, "_week_key", None) != week_key:
+    if g._week_key != week_key:
         g._week_key = week_key
         g._week_trading_day = 1
     else:
@@ -193,7 +197,7 @@ def _update_calendar_state(ContextInfo):
 def is_nth_trading_day_of_week(ContextInfo, n):
     if n <= 0:
         return False
-    return getattr(g, "_week_trading_day", 0) == n
+    return g._week_trading_day == n
 
 
 def _date_to_yyyymmdd(date_value):
@@ -204,6 +208,61 @@ def _date_to_yyyymmdd(date_value):
     return str(date_value)[:8]
 
 
+def _instrument_detail(ContextInfo, stock):
+    try:
+        detail = ContextInfo.get_instrumentdetail(stock)
+    except Exception:
+        return None
+    if isinstance(detail, dict) and detail:
+        return detail
+    return None
+
+
+def _detail_bool(value):
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "y", "交易", "可交易"):
+        return True
+    if text in ("0", "false", "no", "n", "停牌", "不可交易"):
+        return False
+    return None
+
+
+def _is_suspended_detail(detail):
+    is_trading = _detail_bool(detail.get("IsTrading") if isinstance(detail, dict) else None)
+    if is_trading is False:
+        return True
+
+    status = detail.get("InstrumentStatus") if isinstance(detail, dict) else None
+    if status in (None, ""):
+        return False
+    text = str(status)
+    return "停" in text or "暂停" in text
+
+
+def _is_limit_price(price, limit_price):
+    return (
+        np.isfinite(price)
+        and np.isfinite(limit_price)
+        and abs(price - limit_price) <= max(
+            LIMIT_PRICE_MIN_DIFF,
+            limit_price * LIMIT_PRICE_REL_DIFF,
+        )
+    )
+
+
+def _held_stocks():
+    return [stock for stock, shares in g.holdings.items() if shares > 0]
+
+
+def _mark_sell_reason(stock, reason):
+    g.reason_to_sell = reason
+    g.not_buy_again.append(stock)
+
+
 def _get_sector_stocks(ContextInfo, sector_code):
     sector_names = INDEX_SECTOR_NAME_MAP.get(sector_code, [sector_code])
     for sector_name in sector_names:
@@ -212,22 +271,9 @@ def _get_sector_stocks(ContextInfo, sector_code):
         except Exception:
             stocks = []
         if stocks:
-            return list(stocks)
+            return list(dict.fromkeys([stock for stock in stocks if stock]))
     print("获取板块成分股失败 {}, 请确认 QMT 本地板块名: {}".format(sector_code, sector_names))
     return []
-
-
-def _ensure_universe(ContextInfo, stock_list):
-    stocks = list(dict.fromkeys([stock for stock in stock_list if stock]))
-    if not stocks:
-        return
-    try:
-        ContextInfo.set_universe(stocks)
-    except Exception:
-        pass
-    for stock in stocks:
-        if stock not in g.holdings:
-            g.holdings[stock] = 0
 
 
 def _to_float_list(values):
@@ -290,13 +336,13 @@ def _extract_market_series(raw_data, stock, field, count):
     return []
 
 
-def _history(ContextInfo, stock_list, count, field):
+def _history(ContextInfo, stock_list, count, field, end_time=None):
     stocks = list(dict.fromkeys([stock for stock in stock_list if stock]))
     if not stocks:
         return {}
 
     aliases = FIELD_ALIASES.get(field, [field])
-    end_time = _bar_time(ContextInfo)
+    end_time = end_time or g._selection_end_time or _bar_time(ContextInfo)
 
     try:
         raw_data = ContextInfo.get_market_data_ex(
@@ -342,7 +388,7 @@ def _previous(history_map, stock, default=np.nan):
 
 
 def _last_price(ContextInfo, stock, field=None):
-    price_field = field or getattr(g, "order_price_field", "open")
+    price_field = field or g.order_price_field
     price_data = _history(ContextInfo, [stock], 1, price_field)
     price = _latest(price_data, stock)
     if not np.isfinite(price) or price <= 0:
@@ -352,29 +398,11 @@ def _last_price(ContextInfo, stock, field=None):
 
 
 def _stock_name(ContextInfo, stock):
-    for method_name in ("get_instrument_detail", "get_instrumentdetail"):
-        method = getattr(ContextInfo, method_name, None)
-        if method is None:
-            continue
-        try:
-            detail = method(stock)
-            if isinstance(detail, dict):
-                name = detail.get("InstrumentName") or detail.get("instrument_name")
-                if name:
-                    return str(name)
-        except Exception:
-            pass
-
-    for method_name in ("get_stock_name", "get_instrument_name"):
-        method = getattr(ContextInfo, method_name, None)
-        if method is None:
-            continue
-        try:
-            name = method(stock)
-            if name:
-                return str(name)
-        except Exception:
-            pass
+    detail = _instrument_detail(ContextInfo, stock)
+    if detail:
+        name = detail.get("InstrumentName")
+        if name:
+            return str(name)
     return stock
 
 
@@ -385,7 +413,7 @@ def _sync_trade_state(ContextInfo):
     try:
         accounts = get_trade_detail_data(g.accountID, "stock", "account")
         if accounts:
-            available = getattr(accounts[0], "m_dAvailable", None)
+            available = accounts[0].m_dAvailable
             if available is not None:
                 g.money = float(available)
     except Exception:
@@ -401,14 +429,14 @@ def _sync_trade_state(ContextInfo):
 
     synced = {stock: 0 for stock in g.holdings.keys()}
     for pos in positions:
-        code = getattr(pos, "m_strInstrumentID", "")
-        exchange = getattr(pos, "m_strExchangeID", "")
-        volume = getattr(pos, "m_nVolume", 0)
+        code = pos.m_strInstrumentID
+        exchange = pos.m_strExchangeID
+        volume = pos.m_nVolume
         if not code:
             continue
         stock = code if "." in code else "{}.{}".format(code, exchange)
         synced[stock] = int(volume or 0)
-        cost = getattr(pos, "m_dOpenPrice", None)
+        cost = pos.m_dOpenPrice
         if cost is not None and synced[stock] > 0:
             g.buypoint[stock] = float(cost)
 
@@ -420,9 +448,7 @@ def _sync_trade_state(ContextInfo):
 # ==============================================================================
 def prepare_stock_list(ContextInfo):
     _sync_trade_state(ContextInfo)
-    g.hold_list = [
-        stock for stock, shares in g.holdings.items() if shares > 0
-    ]
+    g.hold_list = _held_stocks()
 
     g.not_buy_again = []
     if len(g.history_hold_list) >= g.limit_days:
@@ -440,9 +466,8 @@ def prepare_stock_list(ContextInfo):
     for code in g.hold_list:
         close_price = _previous(close_data, code)
         high_limit = _previous(high_limit_data, code)
-        if np.isfinite(close_price) and np.isfinite(high_limit):
-            if abs(close_price - high_limit) <= max(0.01, high_limit * 0.0001):
-                g.yesterday_HL_list.append(code)
+        if _is_limit_price(close_price, high_limit):
+            g.yesterday_HL_list.append(code)
 
 
 # ==============================================================================
@@ -452,7 +477,7 @@ def weekly_adjustment(ContextInfo):
     if not is_nth_trading_day_of_week(ContextInfo, 2):
         return
 
-    cur_date = _date_to_yyyymmdd(getattr(g, "_current_date", ""))
+    cur_date = _date_to_yyyymmdd(g._current_date)
     print("=" * 60)
     print("【调仓日】{}".format(cur_date))
 
@@ -476,7 +501,7 @@ def weekly_adjustment(ContextInfo):
 # 止损检查
 # ==============================================================================
 def check_stop_loss(ContextInfo):
-    if not getattr(g, "run_stoploss", False):
+    if not g.run_stoploss:
         return
 
     idx_stocks = _get_sector_stocks(ContextInfo, g.index_code)
@@ -506,8 +531,7 @@ def check_stop_loss(ContextInfo):
             print("【个股止损】{} ({}) 跌破成本价 {:.1%}".format(
                 stock, _stock_name(ContextInfo, stock), g.stoploss_limit
             ))
-            g.reason_to_sell = "stoploss"
-            g.not_buy_again.append(stock)
+            _mark_sell_reason(stock, "stoploss")
 
 
 # ==============================================================================
@@ -535,17 +559,14 @@ def check_limit_up(ContextInfo):
         if np.isfinite(last_price) and np.isfinite(high_limit) and last_price < high_limit:
             close_position(ContextInfo, stock)
             print("【涨停打开】卖出 {} ({})".format(stock, _stock_name(ContextInfo, stock)))
-            g.reason_to_sell = "limitup"
-            g.not_buy_again.append(stock)
+            _mark_sell_reason(stock, "limitup")
 
     g.history_hold_list.extend(g.not_buy_again)
 
 
 def check_remain_amount(ContextInfo):
     if g.reason_to_sell in ["limitup", "stoploss"]:
-        g.hold_list = [
-            stock for stock, shares in g.holdings.items() if shares > 0
-        ]
+        g.hold_list = _held_stocks()
         if len(g.hold_list) < g.stock_num and g.target_list:
             target_list = filter_not_buy_again(ContextInfo, g.target_list)
             buy_security(ContextInfo, target_list)
@@ -556,7 +577,21 @@ def check_remain_amount(ContextInfo):
 # 核心选股：小市值初筛 + Barra 量价因子评分排序
 # ==============================================================================
 def get_stock_list(ContextInfo):
+    g._selection_end_time = _previous_bar_end_time(ContextInfo)
+    try:
+        return _get_stock_list_impl(ContextInfo)
+    finally:
+        g._selection_end_time = None
+
+
+def _get_stock_list_impl(ContextInfo):
     initial_list = _get_sector_stocks(ContextInfo, g.index_code)
+    if not initial_list:
+        return []
+
+    base_date = g._previous_trade_date or g._current_date or _get_current_date(ContextInfo)
+    cutoff_date = base_date - datetime.timedelta(days=375)
+    initial_list = filter_listed_before(ContextInfo, initial_list, cutoff_date)
     if not initial_list:
         return []
 
@@ -613,7 +648,8 @@ def get_stock_list(ContextInfo):
     market_cap_map = {}
     if cap_df is not None and not cap_df.empty and cap_df["market_cap"].notna().any():
         cap_df = cap_df[
-            (cap_df["market_cap"] >= 5) & (cap_df["market_cap"] <= 50)
+            (cap_df["market_cap"] >= g.min_market_cap)
+            & (cap_df["market_cap"] <= g.max_market_cap)
         ].sort_values("market_cap")
         if cap_df.empty:
             return []
@@ -621,8 +657,8 @@ def get_stock_list(ContextInfo):
         cap_for_turnover = cap_df["circ_market_cap"] if "circ_market_cap" in cap_df.columns else cap_df["market_cap"]
         market_cap_map = dict(zip(cap_df["code"], cap_for_turnover.fillna(cap_df["market_cap"])))
     else:
-        print("市值计算失败, 本次跳过 5~50 亿市值过滤")
-        candidate_list = initial_list
+        print("市值筛选失败")
+        return []
 
     print("候选股票数量: {}, 开始计算 Barra 因子...".format(len(candidate_list)))
     factor_df = calc_barra_factors(ContextInfo, candidate_list, market_cap_map)
@@ -631,7 +667,7 @@ def get_stock_list(ContextInfo):
         print("Barra 因子计算失败, 退化为市值/原始顺序排序")
         return candidate_list[:g.stock_num]
 
-    factor_df = calc_composite_score(ContextInfo, factor_df)
+    factor_df = calc_composite_score(factor_df)
     factor_df = factor_df.sort_values("composite_score", ascending=True)
     result = factor_df["code"].tolist()
 
@@ -640,8 +676,9 @@ def get_stock_list(ContextInfo):
 
 
 def _get_market_cap_df(ContextInfo, stock_list):
-    override = getattr(g, "market_cap_map", {})
+    override = g.market_cap_map
     close_data = _history(ContextInfo, stock_list, 1, "close")
+    total_value_data = _history(ContextInfo, stock_list, 1, "total_value")
     rows = []
 
     for stock in stock_list:
@@ -651,8 +688,9 @@ def _get_market_cap_df(ContextInfo, stock_list):
             continue
 
         close_price = _latest(close_data, stock)
-        total_share = _get_share_count(ContextInfo, stock, "get_total_share")
-        float_share = _get_share_count(ContextInfo, stock, "get_last_volume")
+        detail = _instrument_detail(ContextInfo, stock)
+        total_share = _normalize_share_count(detail.get("TotalVolume") if detail else None)
+        float_share = _normalize_share_count(detail.get("FloatVolume") if detail else None)
 
         market_cap = np.nan
         circ_market_cap = np.nan
@@ -661,6 +699,11 @@ def _get_market_cap_df(ContextInfo, stock_list):
                 market_cap = close_price * total_share / 1e8
             if np.isfinite(float_share) and float_share > 0:
                 circ_market_cap = close_price * float_share / 1e8
+
+        if not np.isfinite(market_cap):
+            total_value = _latest(total_value_data, stock)
+            if np.isfinite(total_value) and total_value > 0:
+                market_cap = _normalize_market_value_to_yuan([total_value])[-1] / 1e8
 
         if not np.isfinite(circ_market_cap):
             circ_market_cap = market_cap
@@ -673,15 +716,8 @@ def _get_market_cap_df(ContextInfo, stock_list):
     return pd.DataFrame(rows)
 
 
-def _get_share_count(ContextInfo, stock, method_name):
-    method = getattr(ContextInfo, method_name, None)
-    if method is None:
-        return np.nan
-    try:
-        value = method(stock)
-    except Exception:
-        return np.nan
-    value = _extract_scalar(value, method_name)
+def _normalize_share_count(value):
+    value = _extract_scalar(value, "")
     if value is None:
         return np.nan
     try:
@@ -693,64 +729,6 @@ def _get_share_count(ContextInfo, stock, method_name):
     if value < 1e6:
         return value * 10000
     return value
-
-
-def _extract_financial_values(data, field, stock_list):
-    if data is None:
-        return {}
-
-    stock_set = set(stock_list)
-    field_lower = field.lower()
-
-    if isinstance(data, pd.DataFrame):
-        frame = data.copy()
-        if isinstance(frame.index, pd.MultiIndex):
-            frame = frame.reset_index()
-        code_col = None
-        for col in frame.columns:
-            if str(col).lower() in ("code", "stock", "symbol", "secu_code", "instrument"):
-                code_col = col
-                break
-        field_col = None
-        for col in frame.columns:
-            if str(col).lower() == field_lower:
-                field_col = col
-                break
-        if code_col is not None and field_col is not None:
-            result = {}
-            for code, sub in frame.groupby(code_col):
-                if code in stock_set:
-                    value = sub[field_col].dropna()
-                    if not value.empty:
-                        result[code] = float(value.iloc[-1])
-            return result
-        if field in frame.index:
-            row = frame.loc[field]
-            return {
-                stock: float(row[stock])
-                for stock in stock_list
-                if stock in row and pd.notna(row[stock])
-            }
-        return {}
-
-    if isinstance(data, dict):
-        result = {}
-        if field in data and isinstance(data[field], dict):
-            for stock in stock_list:
-                value = data[field].get(stock)
-                if value is not None:
-                    result[stock] = _extract_scalar(value, field)
-            return {k: v for k, v in result.items() if v is not None}
-
-        for stock in stock_list:
-            if stock not in data:
-                continue
-            value = _extract_scalar(data[stock], field)
-            if value is not None:
-                result[stock] = value
-        return result
-
-    return {}
 
 
 def _extract_scalar(value, field):
@@ -883,10 +861,10 @@ def calc_barra_factors(ContextInfo, stock_list, market_cap_map=None):
             row["HSIGMA"] = _calc_hsigma(ret, mkt_ret, g.vol_window, g.vol_halflife)
             row["DASTD"] = _calc_dastd(ret, g.vol_window, g.dastd_halflife)
             row["CMRA"] = _calc_cmra(close, g.cmra_months)
-            row["STOM"] = _calc_stom(money, total_value, g.stom_window)
-            row["STOQ"] = _calc_stoq(money, total_value, g.stoq_window)
-            row["STOA"] = _calc_stoa(money, total_value, g.stoa_window)
-            row["ATVR"] = _calc_atvr(money, total_value, g.vol_window, g.atvr_halflife)
+            row["STOM"] = _calc_stom(volume, total_value, g.stom_window)
+            row["STOQ"] = _calc_stoq(volume, total_value, g.stoq_window)
+            row["STOA"] = _calc_stoa(volume, total_value, g.stoa_window)
+            row["ATVR"] = _calc_atvr(volume, total_value, g.vol_window, g.atvr_halflife)
             records.append(row)
         except Exception:
             continue
@@ -938,15 +916,14 @@ def _calc_dastd(ret, window, halflife):
 
 def _calc_cmra(close, months):
     try:
-        days_per_month = 21
-        total_needed = months * days_per_month + 1
+        total_needed = months * TRADING_DAYS_PER_MONTH + 1
         if len(close) < total_needed:
             return np.nan
         c = close[-total_needed:]
         cum_log_ret = []
         for t in range(1, months + 1):
             end_idx = len(c) - 1
-            start_idx = len(c) - 1 - t * days_per_month
+            start_idx = len(c) - 1 - t * TRADING_DAYS_PER_MONTH
             if start_idx < 0:
                 break
             cum_r = np.log(c[end_idx] / c[start_idx])
@@ -975,52 +952,37 @@ def _calc_stom(turnover_amount, total_value, window):
 
 def _calc_stoq(turnover_amount, total_value, window):
     try:
-        month = 21
-        stom_list = []
-        for i in range(3):
-            start = -window + i * month
-            end = -window + (i + 1) * month
-            if end == 0:
-                amount_seg = turnover_amount[start:]
-                tv_seg = total_value[start:]
-            else:
-                amount_seg = turnover_amount[start:end]
-                tv_seg = total_value[start:end]
-            if len(amount_seg) == 0:
-                continue
-            stom_i = _calc_stom(amount_seg, tv_seg, month)
-            if not np.isnan(stom_i):
-                stom_list.append(stom_i)
-        if not stom_list:
-            return np.nan
-        return float(np.log(np.mean(np.exp(stom_list))))
+        return _calc_average_monthly_stom(turnover_amount, total_value, window, 3)
     except Exception:
         return np.nan
 
 
 def _calc_stoa(turnover_amount, total_value, window):
     try:
-        month = 21
-        stom_list = []
-        for i in range(12):
-            start = -window + i * month
-            end = -window + (i + 1) * month
-            if end == 0:
-                amount_seg = turnover_amount[start:]
-                tv_seg = total_value[start:]
-            else:
-                amount_seg = turnover_amount[start:end]
-                tv_seg = total_value[start:end]
-            if len(amount_seg) == 0:
-                continue
-            stom_i = _calc_stom(amount_seg, tv_seg, month)
-            if not np.isnan(stom_i):
-                stom_list.append(stom_i)
-        if not stom_list:
-            return np.nan
-        return float(np.log(np.mean(np.exp(stom_list))))
+        return _calc_average_monthly_stom(turnover_amount, total_value, window, 12)
     except Exception:
         return np.nan
+
+
+def _calc_average_monthly_stom(turnover_amount, total_value, window, periods):
+    stom_list = []
+    for i in range(periods):
+        start = -window + i * TRADING_DAYS_PER_MONTH
+        end = -window + (i + 1) * TRADING_DAYS_PER_MONTH
+        if end == 0:
+            amount_seg = turnover_amount[start:]
+            tv_seg = total_value[start:]
+        else:
+            amount_seg = turnover_amount[start:end]
+            tv_seg = total_value[start:end]
+        if len(amount_seg) == 0:
+            continue
+        stom_i = _calc_stom(amount_seg, tv_seg, TRADING_DAYS_PER_MONTH)
+        if not np.isnan(stom_i):
+            stom_list.append(stom_i)
+    if not stom_list:
+        return np.nan
+    return float(np.log(np.mean(np.exp(stom_list))))
 
 
 def _calc_atvr(turnover_amount, total_value, window, halflife):
@@ -1056,7 +1018,7 @@ def _zscore(series):
     return (series - mu) / std
 
 
-def calc_composite_score(ContextInfo, df):
+def calc_composite_score(df):
     factor_cols = list(g.factor_weights.keys())
     df = df.copy()
 
@@ -1090,12 +1052,38 @@ def calc_composite_score(ContextInfo, df):
 # ==============================================================================
 # 过滤函数集合
 # ==============================================================================
+def filter_listed_before(ContextInfo, stock_list, cutoff_date):
+    result = []
+    for stock in stock_list:
+        detail = _instrument_detail(ContextInfo, stock)
+        if not detail:
+            result.append(stock)
+            continue
+        open_date = _parse_qmt_date(detail.get("OpenDate"))
+        if open_date is None or open_date <= cutoff_date:
+            result.append(stock)
+    return result
+
+
+def _parse_qmt_date(value):
+    if value in (None, "", 0, "0", "19700101", "99999999"):
+        return None
+    try:
+        return datetime.datetime.strptime(str(value)[:8], "%Y%m%d").date()
+    except Exception:
+        return None
+
+
 def filter_paused_stock(ContextInfo, stock_list):
     suspend_data = _history(ContextInfo, stock_list, 1, "suspend")
     close_data = _history(ContextInfo, stock_list, 1, "close")
     volume_data = _history(ContextInfo, stock_list, 1, "volume")
     result = []
     for stock in stock_list:
+        detail = _instrument_detail(ContextInfo, stock)
+        if _is_suspended_detail(detail):
+            continue
+
         suspend_flag = _latest(suspend_data, stock, default=np.nan)
         if np.isfinite(suspend_flag) and int(suspend_flag) == 1:
             continue
@@ -1125,48 +1113,29 @@ def filter_kcbj_stock(ContextInfo, stock_list):
     ]
 
 
-def filter_limitup_stock(ContextInfo, stock_list):
+def _filter_limit_stock(ContextInfo, stock_list, limit_field):
     if not stock_list:
         return []
-    close_data = _history(ContextInfo, stock_list, 2, "close")
-    high_limit_data = _history(ContextInfo, stock_list, 2, "high_limit")
-    if not high_limit_data:
+    close_data = _history(ContextInfo, stock_list, 1, "close")
+    limit_data = _history(ContextInfo, stock_list, 1, limit_field)
+    if not limit_data:
         return stock_list
     result = []
     hold_set = set(g.hold_list)
     for stock in stock_list:
-        close_price = _previous(close_data, stock)
-        high_limit = _previous(high_limit_data, stock)
-        is_limit = (
-            np.isfinite(close_price)
-            and np.isfinite(high_limit)
-            and abs(close_price - high_limit) <= max(0.01, high_limit * 0.0001)
-        )
-        if stock in hold_set or not is_limit:
+        close_price = _latest(close_data, stock)
+        limit_price = _latest(limit_data, stock)
+        if stock in hold_set or not _is_limit_price(close_price, limit_price):
             result.append(stock)
     return result
+
+
+def filter_limitup_stock(ContextInfo, stock_list):
+    return _filter_limit_stock(ContextInfo, stock_list, "high_limit")
 
 
 def filter_limitdown_stock(ContextInfo, stock_list):
-    if not stock_list:
-        return []
-    close_data = _history(ContextInfo, stock_list, 2, "close")
-    low_limit_data = _history(ContextInfo, stock_list, 2, "low_limit")
-    if not low_limit_data:
-        return stock_list
-    result = []
-    hold_set = set(g.hold_list)
-    for stock in stock_list:
-        close_price = _previous(close_data, stock)
-        low_limit = _previous(low_limit_data, stock)
-        is_limit = (
-            np.isfinite(close_price)
-            and np.isfinite(low_limit)
-            and abs(close_price - low_limit) <= max(0.01, low_limit * 0.0001)
-        )
-        if stock in hold_set or not is_limit:
-            result.append(stock)
-    return result
+    return _filter_limit_stock(ContextInfo, stock_list, "low_limit")
 
 
 def filter_highprice_stock(ContextInfo, stock_list):
@@ -1188,10 +1157,14 @@ def filter_not_buy_again(ContextInfo, stock_list):
 # ==============================================================================
 # 交易辅助函数
 # ==============================================================================
-def _calc_order_cost(ContextInfo, value, is_sell=False):
+def _calc_order_cost(value, is_sell=False):
     commission = max(abs(value) * g.commission_rate, g.min_commission)
     tax = abs(value) * g.close_tax_rate if is_sell else 0.0
     return commission + tax
+
+
+def _round_lot_by_value(value, price):
+    return int(value / price / LOT_SIZE) * LOT_SIZE
 
 
 def order_target_value_(ContextInfo, security, value):
@@ -1203,21 +1176,21 @@ def order_target_value_(ContextInfo, security, value):
     current_value = current_shares * price
     delta_value = float(value) - current_value
 
-    if abs(delta_value) < price * 100:
+    if abs(delta_value) < price * LOT_SIZE:
         return False
 
     if delta_value > 0:
-        shares = int(delta_value / price / 100) * 100
-        if shares < 100:
+        shares = _round_lot_by_value(delta_value, price)
+        if shares < LOT_SIZE:
             return False
         order_value = shares * price
-        cost = _calc_order_cost(ContextInfo, order_value, is_sell=False)
+        cost = _calc_order_cost(order_value, is_sell=False)
         if g.money < order_value + cost:
-            shares = int((g.money - cost) / price / 100) * 100
+            shares = _round_lot_by_value(g.money - cost, price)
             order_value = shares * price
-            if shares < 100:
+            if shares < LOT_SIZE:
                 return False
-            cost = _calc_order_cost(ContextInfo, order_value, is_sell=False)
+            cost = _calc_order_cost(order_value, is_sell=False)
         order_shares(security, shares, "FIX", price, ContextInfo, g.accountID)
         g.money -= order_value + cost
         g.profit -= cost
@@ -1228,13 +1201,13 @@ def order_target_value_(ContextInfo, security, value):
         ))
         return True
 
-    shares = min(current_shares, int(abs(delta_value) / price / 100) * 100)
+    shares = min(current_shares, _round_lot_by_value(abs(delta_value), price))
     if value == 0:
         shares = current_shares
     if shares <= 0:
         return False
     order_value = shares * price
-    cost = _calc_order_cost(ContextInfo, order_value, is_sell=True)
+    cost = _calc_order_cost(order_value, is_sell=True)
     order_shares(security, -shares, "FIX", price, ContextInfo, g.accountID)
     buy_price = g.buypoint.get(security, price)
     g.money += order_value - cost
@@ -1258,9 +1231,7 @@ def close_position(ContextInfo, security):
 
 
 def buy_security(ContextInfo, target_list):
-    current_hold = {
-        stock for stock, shares in g.holdings.items() if shares > 0
-    }
+    current_hold = set(_held_stocks())
     to_buy = [
         stock for stock in target_list
         if stock not in current_hold and stock not in g.history_hold_list
