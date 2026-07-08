@@ -1,25 +1,375 @@
 # coding: utf-8
 """
-QMT 转换版：低波动小市值
+XtQuant / MiniQMT 版：低波动小市值
 
 原始策略来自聚宽：小市值 + Barra CNE6 量价因子。
-init(ContextInfo) 初始化，handlebar(ContextInfo) 按 QMT bar 时间模拟聚宽日内任务。
+本文件是独立 Python 脚本，面向 MiniQMT 客户端外部运行：
+1. xtdata 负责板块、合约、历史行情和实时全推行情。
+2. XtQuantTrader 负责账户、持仓查询和股票委托。
+3. 策略主体沿用内置 Python 版本的选股、风控和调仓语义。
 
-单文件结构：
-1. 初始化区：区分 QMT 界面参数、策略参数、运行状态和账户状态。
-2. QMT 适配区：处理 bar 时间、行情、板块、合约详情、账户持仓。
-3. 调度区：把聚宽日内任务语义映射到 QMT handlebar。
-4. 组合区：判断是否调仓、计算目标权重和目标金额。
-5. 选股区：股票池过滤、市值过滤、Barra 因子和综合排序。
-6. 交易区：把目标金额转换成 QMT 回测下单。
+默认 DRY_RUN=True，只打印拟委托；确认账户、行情和候选池正常后，再用
+--live-trade 或环境变量 XTQUANT_LIVE_TRADE=1 打开真实委托。
 """
 
+import argparse
 import datetime
+import os
+import random
+import sys
 import time
 from decimal import Decimal, ROUND_HALF_UP
 
 import numpy as np
 import pandas as pd
+
+try:
+    from . import factors as factor_module
+except ImportError:
+    import factors as factor_module
+
+sys.path.insert(0, r"C:\Users\alex\Documents\qmt_lib\xtquant_250807")
+
+try:
+    from xtquant import xtconstant, xtdata
+    from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback
+    from xtquant.xttype import StockAccount
+except ImportError:
+    xtconstant = None
+    xtdata = None
+    XtQuantTrader = None
+    StockAccount = None
+
+    class XtQuantTraderCallback(object):
+        pass
+
+
+USERDATA_MINI_PATH = os.environ.get("XTQUANT_USERDATA_MINI", r"")
+ACCOUNT_ID = os.environ.get("XTQUANT_ACCOUNT_ID", "")
+ACCOUNT_TYPE = os.environ.get("XTQUANT_ACCOUNT_TYPE", "STOCK")
+SESSION_ID = int(os.environ.get("XTQUANT_SESSION_ID", "0") or "0")
+DRY_RUN = os.environ.get("XTQUANT_LIVE_TRADE", "0").lower() not in ("1", "true", "yes", "y")
+DEFAULT_INITIAL_CASH = float(os.environ.get("XTQUANT_INITIAL_CASH", "1000000") or "1000000")
+DEFAULT_DIVIDEND_TYPE = "front"
+
+
+class StrategyConfig(object):
+    def __init__(
+        self,
+        userdata_mini_path,
+        account_id,
+        account_type="STOCK",
+        session_id=0,
+        dry_run=True,
+        initial_cash=DEFAULT_INITIAL_CASH,
+        period="1d",
+        dividend_type=DEFAULT_DIVIDEND_TYPE,
+        universe_index_code="399101.SZ",
+        factor_benchmark="000300.SH",
+        report_benchmark="000300.SH",
+        strategy_name="低波动小市值_xtquant",
+        price_type="latest",
+        auto_download_history=True,
+        download_batch_size=300,
+        sleep_seconds=20,
+    ):
+        self.userdata_mini_path = userdata_mini_path
+        self.account_id = account_id
+        self.account_type = account_type or "STOCK"
+        self.session_id = int(session_id or 0)
+        self.dry_run = bool(dry_run)
+        self.initial_cash = float(initial_cash or DEFAULT_INITIAL_CASH)
+        self.period = period or "1d"
+        self.dividend_type = dividend_type or "front"
+        self.universe_index_code = universe_index_code
+        self.factor_benchmark = factor_benchmark
+        self.report_benchmark = report_benchmark
+        self.strategy_name = strategy_name
+        self.price_type = price_type
+        self.auto_download_history = bool(auto_download_history)
+        self.download_batch_size = int(download_batch_size or 300)
+        self.sleep_seconds = int(sleep_seconds or 20)
+
+
+def _ensure_xtquant():
+    if xtdata is None or XtQuantTrader is None or StockAccount is None:
+        raise RuntimeError(
+            "未找到 xtquant 库。请在安装了 MiniQMT/xtquant 的 Python 环境中运行本脚本。"
+        )
+
+
+def _numeric_attr(obj, names, default=np.nan):
+    for name in names:
+        if hasattr(obj, name):
+            value = getattr(obj, name)
+            try:
+                if value is not None:
+                    return float(value)
+            except Exception:
+                pass
+    return default
+
+
+def _text_attr(obj, names, default=""):
+    for name in names:
+        if hasattr(obj, name):
+            value = getattr(obj, name)
+            if value not in (None, ""):
+                return str(value)
+    return default
+
+
+def _normalize_xt_market_data(raw_data, field_list, stock_list):
+    if not isinstance(raw_data, dict) or not field_list:
+        return raw_data
+    if not all(field in raw_data and isinstance(raw_data[field], pd.DataFrame) for field in field_list):
+        return raw_data
+
+    result = {}
+    for stock in stock_list:
+        columns = {}
+        index = None
+        for field in field_list:
+            frame = raw_data.get(field)
+            if frame is None or frame.empty:
+                continue
+            if stock in frame.index:
+                series = frame.loc[stock]
+            elif stock in frame.columns:
+                series = frame[stock]
+            else:
+                continue
+            if index is None:
+                index = series.index
+            columns[field] = pd.to_numeric(series, errors="coerce")
+        if columns:
+            result[stock] = pd.DataFrame(columns, index=index)
+    return result
+
+
+class XtQuantContext(object):
+    xtquant_mode = True
+
+    def __init__(self, config, trader=None, account=None):
+        self.config = config
+        self.trader = trader
+        self.account = account
+        self.do_back_test = False
+        self.benchmark = config.report_benchmark
+        self.dividend_type = config.dividend_type
+        self.period = config.period
+        self._download_cache = set()
+        self._sector_data_checked = False
+        self.refresh_clock()
+        self.capital = self._initial_capital()
+
+    def refresh_clock(self):
+        self.now = datetime.datetime.now()
+        self.barpos = int(time.time())
+
+    def _initial_capital(self):
+        asset = self.query_stock_asset()
+        total_asset = _numeric_attr(asset, ("total_asset", "asset", "m_dBalance"), np.nan)
+        cash = _numeric_attr(asset, ("cash", "available_cash", "enable_balance", "m_dAvailable"), np.nan)
+        for value in (total_asset, cash, self.config.initial_cash):
+            if np.isfinite(value) and value > 0:
+                return float(value)
+        return float(DEFAULT_INITIAL_CASH)
+
+    def get_stock_list_in_sector(self, sector_name):
+        _ensure_xtquant()
+        stocks = xtdata.get_stock_list_in_sector(sector_name) or []
+        if stocks:
+            return stocks
+        if not self._sector_data_checked and hasattr(xtdata, "download_sector_data"):
+            self._sector_data_checked = True
+            try:
+                xtdata.download_sector_data()
+                stocks = xtdata.get_stock_list_in_sector(sector_name) or []
+            except Exception as exc:
+                print("下载板块分类信息失败: {}".format(exc))
+        return stocks
+
+    def get_instrumentdetail(self, stock):
+        _ensure_xtquant()
+        try:
+            return xtdata.get_instrument_detail(stock, False)
+        except TypeError:
+            return xtdata.get_instrument_detail(stock)
+
+    def get_market_data_ex(
+        self,
+        field_list,
+        stock_list,
+        period="1d",
+        start_time="",
+        end_time="",
+        count=-1,
+        dividend_type="none",
+        fill_data=True,
+        subscribe=False,
+    ):
+        del subscribe
+        _ensure_xtquant()
+        stocks = list(dict.fromkeys([stock for stock in stock_list if stock]))
+        self._download_history(stocks, period, end_time)
+
+        getter = getattr(xtdata, "get_market_data_ex", None)
+        if getter is not None:
+            try:
+                raw = getter(
+                    field_list,
+                    stocks,
+                    period=period,
+                    start_time=start_time,
+                    end_time=end_time,
+                    count=count,
+                    dividend_type=dividend_type,
+                    fill_data=fill_data,
+                )
+                return _normalize_xt_market_data(raw, field_list, stocks)
+            except TypeError:
+                pass
+
+        raw = xtdata.get_market_data(
+            field_list=field_list,
+            stock_list=stocks,
+            period=period,
+            start_time=start_time,
+            end_time=end_time,
+            count=count,
+            dividend_type=dividend_type,
+            fill_data=fill_data,
+        )
+        return _normalize_xt_market_data(raw, field_list, stocks)
+
+    def _download_history(self, stock_list, period, end_time):
+        if not self.config.auto_download_history or not stock_list:
+            return
+        end_key = str(end_time or self.now.strftime("%Y%m%d"))[:8]
+        missing = [
+            stock for stock in stock_list
+            if (stock, period, end_key) not in self._download_cache
+        ]
+        if not missing:
+            return
+
+        batch_size = max(int(self.config.download_batch_size), 1)
+        for start in range(0, len(missing), batch_size):
+            batch = missing[start:start + batch_size]
+            try:
+                if hasattr(xtdata, "download_history_data2"):
+                    xtdata.download_history_data2(
+                        batch,
+                        period,
+                        start_time="",
+                        end_time=end_time or "",
+                        callback=None,
+                        incrementally=True,
+                    )
+                else:
+                    for stock in batch:
+                        xtdata.download_history_data(stock, period, end_time=end_time or "", incrementally=True)
+                for stock in batch:
+                    self._download_cache.add((stock, period, end_key))
+            except Exception as exc:
+                print("下载历史行情失败 period={} stocks={}: {}".format(
+                    period, _stock_sample(batch), exc
+                ))
+
+    def get_full_tick(self, code_list):
+        _ensure_xtquant()
+        return xtdata.get_full_tick(code_list)
+
+    def query_stock_asset(self):
+        if self.trader is None or self.account is None:
+            return None
+        try:
+            return self.trader.query_stock_asset(self.account)
+        except Exception as exc:
+            print("xtquant 资产查询失败: {}".format(exc))
+            return None
+
+    def query_stock_positions(self):
+        if self.trader is None or self.account is None:
+            return []
+        try:
+            return self.trader.query_stock_positions(self.account) or []
+        except Exception as exc:
+            print("xtquant 持仓查询失败: {}".format(exc))
+            return []
+
+    def order_stock(self, stock, order_type, shares, price_type, price, remark):
+        if self.trader is None or self.account is None:
+            raise RuntimeError("未连接交易账号，无法下单")
+        return self.trader.order_stock(
+            self.account,
+            stock,
+            order_type,
+            shares,
+            price_type,
+            price,
+            self.config.strategy_name,
+            remark,
+        )
+
+    def previous_trading_date(self, current_date):
+        _ensure_xtquant()
+        start = (current_date - datetime.timedelta(days=30)).strftime("%Y%m%d")
+        end = current_date.strftime("%Y%m%d")
+        dates = xtdata.get_trading_calendar("SH", start, end) or []
+        parsed = [_parse_xt_trading_date(value) for value in dates]
+        parsed = [value for value in parsed if value is not None and value < current_date]
+        return parsed[-1] if parsed else current_date
+
+    def is_trading_day(self, current_date):
+        _ensure_xtquant()
+        day = current_date.strftime("%Y%m%d")
+        dates = xtdata.get_trading_calendar("SH", day, day) or []
+        return any(_parse_xt_trading_date(value) == current_date for value in dates)
+
+    def paint(self, *args, **kwargs):
+        del args, kwargs
+
+    def draw_text(self, *args, **kwargs):
+        del args, kwargs
+
+    def draw_vertline(self, *args, **kwargs):
+        del args, kwargs
+
+
+class StrategyTraderCallback(XtQuantTraderCallback):
+    def on_disconnected(self):
+        print("xtquant 交易连接断开")
+
+    def on_stock_order(self, order):
+        print("委托回报: {} status={} order_id={}".format(
+            _text_attr(order, ("stock_code", "stock_code1"), ""),
+            _text_attr(order, ("order_status",), ""),
+            _text_attr(order, ("order_id", "order_sysid"), ""),
+        ))
+
+    def on_stock_trade(self, trade):
+        print("成交回报: {} {}股 price={}".format(
+            _text_attr(trade, ("stock_code", "stock_code1"), ""),
+            _text_attr(trade, ("traded_volume", "volume"), ""),
+            _text_attr(trade, ("traded_price", "price"), ""),
+        ))
+
+    def on_order_error(self, order_error):
+        print("委托失败: order_id={} error_id={} msg={}".format(
+            _text_attr(order_error, ("order_id",), ""),
+            _text_attr(order_error, ("error_id",), ""),
+            _text_attr(order_error, ("error_msg",), ""),
+        ))
+
+
+def _parse_xt_trading_date(value):
+    text = str(value).replace("-", "")[:8]
+    try:
+        return datetime.datetime.strptime(text, "%Y%m%d").date()
+    except Exception:
+        return None
 
 
 class G:
@@ -32,7 +382,6 @@ LOT_SIZE = 100
 TRADING_DAYS_PER_MONTH = 21
 LIMIT_PRICE_MIN_DIFF = 0.01
 LIMIT_PRICE_REL_DIFF = 0.0001
-DEFAULT_DIVIDEND_TYPE = "front"
 FACTOR_NAMES = ("HSIGMA", "DASTD", "CMRA", "STOM", "STOQ", "STOA", "ATVR")
 
 FIELD_MAP = {
@@ -66,6 +415,22 @@ def init(ContextInfo):
 
 
 def _init_platform_config(ContextInfo):
+    if getattr(ContextInfo, "xtquant_mode", False):
+        cfg = ContextInfo.config
+        g.is_backtest = False
+        g.universe_index_code = cfg.universe_index_code
+        g.factor_benchmark = cfg.factor_benchmark
+        g.report_benchmark = cfg.report_benchmark
+        g.accountID = cfg.account_id
+        g.account_type = cfg.account_type
+        g.price_dividend_type = cfg.dividend_type
+        g.ui_dividend_type = cfg.dividend_type
+        g.subscribe_market_data = True
+        g.xt_dry_run = bool(cfg.dry_run)
+        g.xt_price_type = cfg.price_type
+        g.xt_strategy_name = cfg.strategy_name
+        return
+
     # QMT 界面配置负责驱动回测和绩效展示；策略内部变量负责选股和因子语义。
     g.is_backtest = bool(ContextInfo.do_back_test)
     g.universe_index_code = "399101.SZ"
@@ -251,6 +616,10 @@ def _parse_bar_datetime(value):
 
 
 def _bar_datetime(ContextInfo):
+    if getattr(ContextInfo, "xtquant_mode", False):
+        ContextInfo.refresh_clock()
+        return ContextInfo.now
+
     try:
         tag = ContextInfo.get_bar_timetag(ContextInfo.barpos)
         value = timetag_to_datetime(tag, "%Y%m%d%H%M%S")
@@ -267,6 +636,11 @@ def _bar_time(ContextInfo, fmt="%Y%m%d%H%M%S"):
 
 
 def _previous_bar_end_time(ContextInfo):
+    if getattr(ContextInfo, "xtquant_mode", False):
+        current_date = g._current_date or _get_current_date(ContextInfo)
+        trade_date = ContextInfo.previous_trading_date(current_date)
+        return _date_to_yyyymmdd(trade_date) + "150000"
+
     trade_date = g._previous_trade_date or _get_current_date(ContextInfo)
     return _date_to_yyyymmdd(trade_date) + "150000"
 
@@ -654,8 +1028,8 @@ def _get_sector_stocks(ContextInfo, sector_code):
     stocks = ContextInfo.get_stock_list_in_sector(sector_name)
     stocks = _dedupe_stocks(stocks)
     if not stocks:
-        raise RuntimeError("QMT 板块 {} 未返回成分股, 请检查客户端左侧板块或本地数据".format(sector_name))
-    print("股票池 {} 使用 QMT 板块 {}, 成分 {} 只".format(sector_code, sector_name, len(stocks)))
+        raise RuntimeError("板块 {} 未返回成分股, 请检查 MiniQMT 客户端板块/本地数据".format(sector_name))
+    print("股票池 {} 使用板块 {}, 成分 {} 只".format(sector_code, sector_name, len(stocks)))
     return stocks
 
 
@@ -814,7 +1188,52 @@ def _stock_name(ContextInfo, stock):
     return stock
 
 
+def _sync_xtquant_trade_state(ContextInfo):
+    asset = ContextInfo.query_stock_asset()
+    if asset is not None:
+        available = _numeric_attr(
+            asset,
+            ("cash", "available_cash", "enable_balance", "m_dAvailable"),
+            np.nan,
+        )
+        if np.isfinite(available):
+            g.money = float(available)
+    else:
+        _log_once("xt-account-empty", "xtquant 资产查询为空, 使用本地资金状态")
+
+    positions = ContextInfo.query_stock_positions()
+    if not positions:
+        _log_once("xt-position-empty", "xtquant 持仓查询为空, 使用本地持仓状态")
+        return
+
+    synced = {stock: 0 for stock in g.holdings.keys()}
+    for pos in positions:
+        stock = _text_attr(pos, ("stock_code", "stock_code1", "m_strInstrumentID"), "")
+        if not stock:
+            code = _text_attr(pos, ("instrument_id",), "")
+            market = _text_attr(pos, ("market", "exchange_id", "m_strExchangeID"), "")
+            stock = "{}.{}".format(code, market) if code and market else code
+        if not stock:
+            continue
+
+        volume = _numeric_attr(pos, ("volume", "m_nVolume"), np.nan)
+        if not np.isfinite(volume):
+            _log_once("xt-position-volume-missing-{}".format(stock), "持仓同步跳过: {} volume 为空".format(stock))
+            continue
+        synced[stock] = int(volume)
+
+        cost = _numeric_attr(pos, ("avg_price", "open_price", "m_dOpenPrice"), np.nan)
+        if np.isfinite(cost) and synced[stock] > 0:
+            g.buypoint[stock] = float(cost)
+
+    g.holdings.update(synced)
+
+
 def _sync_trade_state(ContextInfo):
+    if getattr(ContextInfo, "xtquant_mode", False):
+        _sync_xtquant_trade_state(ContextInfo)
+        return
+
     if "get_trade_detail_data" not in globals():
         _log_once("trade-detail-missing", "未发现 get_trade_detail_data, 使用脚本本地持仓/资金状态")
         return
@@ -1707,6 +2126,15 @@ def _reason_counts(items):
 
 
 def calc_barra_factors(ContextInfo, stock_list, turnover_share_map=None):
+    return factor_module.calc_barra_factors(
+        ContextInfo,
+        stock_list,
+        g,
+        _history,
+        _normalize_share_count,
+        turnover_share_map,
+    )
+
     if not stock_list:
         return None
 
@@ -1941,6 +2369,8 @@ def _zscore(series):
 
 
 def calc_composite_score(df):
+    return factor_module.calc_composite_score(df, g.factor_weights)
+
     factor_cols = list(g.factor_weights.keys())
     df = df.copy()
     for col in factor_cols:
@@ -2158,8 +2588,80 @@ def _round_lot_by_value(value, price):
     return int(value / price / LOT_SIZE) * LOT_SIZE
 
 
+def _live_tick_price(ContextInfo, stock):
+    if not getattr(ContextInfo, "xtquant_mode", False):
+        return np.nan
+    try:
+        tick_data = ContextInfo.get_full_tick([stock]) or {}
+        tick = tick_data.get(stock) or {}
+    except Exception as exc:
+        _log_once("tick-price-error-{}".format(stock), "读取实时行情失败 {}: {}".format(stock, exc))
+        return np.nan
+
+    for key in ("lastPrice", "last_price", "price", "last"):
+        try:
+            price = float(tick.get(key))
+        except Exception:
+            price = np.nan
+        if np.isfinite(price) and price > 0:
+            return price
+    return np.nan
+
+
+def _order_reference_price(ContextInfo, stock):
+    if getattr(ContextInfo, "xtquant_mode", False):
+        price = _live_tick_price(ContextInfo, stock)
+        if np.isfinite(price) and price > 0:
+            return price
+    return _last_price(ContextInfo, stock)
+
+
+def _xtconstant(name, fallback):
+    if xtconstant is None:
+        return fallback
+    return getattr(xtconstant, name, fallback)
+
+
+def _submit_order(ContextInfo, security, shares, side, reference_price):
+    if not getattr(ContextInfo, "xtquant_mode", False):
+        signed_shares = shares if side == "BUY" else -shares
+        order_shares(security, signed_shares, "FIX", reference_price, ContextInfo, g.accountID)
+        return True
+
+    side_text = "买入" if side == "BUY" else "卖出"
+    if getattr(g, "xt_dry_run", True):
+        print("[DRY-RUN] {} {}({}) {}股 参考价 {:.3f}".format(
+            side_text, security, _stock_name(ContextInfo, security), shares, reference_price
+        ))
+        return True
+
+    _ensure_xtquant()
+    order_type = _xtconstant("STOCK_BUY", 23) if side == "BUY" else _xtconstant("STOCK_SELL", 24)
+    if str(getattr(g, "xt_price_type", "latest")).lower() == "fix":
+        price_type = _xtconstant("FIX_PRICE", 11)
+        order_price = float(reference_price)
+    else:
+        price_type = _xtconstant("LATEST_PRICE", 5)
+        order_price = 0.0
+
+    remark = "{}_{}_{}".format(getattr(g, "xt_strategy_name", "low_vol"), side.lower(), int(time.time()))
+    try:
+        order_id = ContextInfo.order_stock(security, order_type, int(shares), price_type, order_price, remark)
+    except Exception as exc:
+        print("xtquant 下单异常: {} {} {}股: {}".format(side_text, security, shares, exc))
+        return False
+
+    if order_id in (-1, None):
+        print("xtquant 下单失败: {} {} {}股 price_type={} price={}".format(
+            side_text, security, shares, price_type, order_price
+        ))
+        return False
+    print("xtquant 下单已提交: {} {} {}股 order_id={}".format(side_text, security, shares, order_id))
+    return True
+
+
 def order_target_value_(ContextInfo, security, value):
-    price = _last_price(ContextInfo, security)
+    price = _order_reference_price(ContextInfo, security)
     if not np.isfinite(price) or price <= 0:
         _log_once(
             "order-price-invalid-{}".format(security),
@@ -2200,7 +2702,8 @@ def order_target_value_(ContextInfo, security, value):
                 )
                 return False
             cost = _calc_order_cost(order_value, is_sell=False)
-        order_shares(security, shares, "FIX", price, ContextInfo, g.accountID)
+        if not _submit_order(ContextInfo, security, shares, "BUY", price):
+            return False
         g._diag_buy_count += 1
         _mark_diag_event(90, "买")
         g.money -= order_value + cost
@@ -2219,7 +2722,8 @@ def order_target_value_(ContextInfo, security, value):
         return False
     order_value = shares * price
     cost = _calc_order_cost(order_value, is_sell=True)
-    order_shares(security, -shares, "FIX", price, ContextInfo, g.accountID)
+    if not _submit_order(ContextInfo, security, shares, "SELL", price):
+        return False
     g._diag_sell_count += 1
     _mark_diag_event(95, "卖")
     buy_price = g.buypoint.get(security)
@@ -2260,3 +2764,180 @@ def buy_security(ContextInfo, target_list):
         sell_unmatched=False,
         allow_reduce=False,
     )
+
+
+XTQUANT_SCHEDULE = (
+    ("prepare", "09:25", prepare_stock_list),
+    ("rebalance", "10:00", rebalance_check),
+    ("stoploss_1030", "10:30", check_stop_loss),
+    ("stoploss_1400", "14:00", check_stop_loss),
+    ("afternoon", "14:30", trade_afternoon),
+)
+
+
+def _connect_xtquant_context(config):
+    _ensure_xtquant()
+    trader = None
+    account = None
+
+    if config.account_id and config.userdata_mini_path:
+        account = StockAccount(config.account_id, config.account_type)
+        session_id = int(config.session_id or random.randint(100000, 999999))
+        callback = StrategyTraderCallback()
+        try:
+            trader = XtQuantTrader(config.userdata_mini_path, session_id, callback=callback)
+        except TypeError:
+            trader = XtQuantTrader(config.userdata_mini_path, session_id)
+            trader.register_callback(callback)
+        trader.start()
+        connect_result = trader.connect()
+        if connect_result != 0:
+            raise RuntimeError("XtQuantTrader 连接失败, connect_result={}".format(connect_result))
+        subscribe_result = trader.subscribe(account)
+        print("xtquant 已连接: account={} type={} session_id={} subscribe={}".format(
+            config.account_id, config.account_type, session_id, subscribe_result
+        ))
+    elif not config.dry_run:
+        raise RuntimeError("真实交易必须配置 --userdata-mini 和 --account")
+    else:
+        print("未配置交易账号或 userdata_mini，进入仅行情/DRY-RUN 模式。")
+
+    return XtQuantContext(config, trader=trader, account=account)
+
+
+def _initialize_strategy(ContextInfo):
+    init(ContextInfo)
+    if getattr(ContextInfo, "xtquant_mode", False):
+        g.enable_chart_diagnostics = False
+    _update_calendar_state(ContextInfo)
+    _sync_trade_state(ContextInfo)
+    print("运行模式: {}, 可用资金 {:.2f}, 当前持仓 {} 只".format(
+        "DRY-RUN" if getattr(g, "xt_dry_run", True) else "LIVE-TRADE",
+        g.money,
+        len(_held_stocks()),
+    ))
+
+
+def _run_task(ContextInfo, task_name, func):
+    ContextInfo.refresh_clock()
+    _update_calendar_state(ContextInfo)
+    _reset_bar_diagnostics()
+    print("【xtquant任务】{} {}".format(task_name, ContextInfo.now.strftime("%Y-%m-%d %H:%M:%S")))
+    func(ContextInfo)
+
+
+def _run_daily_once(ContextInfo):
+    for task_name, _trigger_time, func in XTQUANT_SCHEDULE:
+        _run_task(ContextInfo, task_name, func)
+
+
+def _run_scan(ContextInfo):
+    ContextInfo.refresh_clock()
+    _update_calendar_state(ContextInfo)
+    _reset_bar_diagnostics()
+    ranked = get_stock_list(ContextInfo)
+    print("候选排序前 {} 只: {}".format(min(20, len(ranked)), ranked[:20]))
+
+
+def _is_task_due(now, trigger_time):
+    hour, minute = [int(part) for part in trigger_time.split(":")]
+    return now.time() >= datetime.time(hour, minute)
+
+
+def _run_loop(ContextInfo):
+    print("进入 xtquant 盘中循环，任务: {}".format(
+        [(name, trigger) for name, trigger, _func in XTQUANT_SCHEDULE]
+    ))
+    while True:
+        try:
+            ContextInfo.refresh_clock()
+            current_date = ContextInfo.now.date()
+            if ContextInfo.is_trading_day(current_date):
+                for task_name, trigger_time, func in XTQUANT_SCHEDULE:
+                    if _task_done(task_name, current_date):
+                        continue
+                    if not _is_task_due(ContextInfo.now, trigger_time):
+                        continue
+                    try:
+                        _run_task(ContextInfo, task_name, func)
+                    finally:
+                        _mark_task_done(task_name, current_date)
+            else:
+                if not _task_done("non_trading_day", current_date):
+                    print("{} 非交易日，等待下一轮。".format(_date_to_yyyymmdd(current_date)))
+                    _mark_task_done("non_trading_day", current_date)
+        except KeyboardInterrupt:
+            print("收到 Ctrl+C，退出 xtquant 循环。")
+            break
+        except Exception as exc:
+            print("xtquant 循环异常: {}".format(exc))
+        time.sleep(ContextInfo.config.sleep_seconds)
+
+
+def _build_arg_parser():
+    parser = argparse.ArgumentParser(description="低波动小市值 xtquant / MiniQMT 独立脚本")
+    parser.add_argument("--userdata-mini", default=USERDATA_MINI_PATH, help="MiniQMT userdata_mini 完整路径")
+    parser.add_argument("--account", default=ACCOUNT_ID, help="资金账号")
+    parser.add_argument("--account-type", default=ACCOUNT_TYPE, help="账号类型，股票通常为 STOCK")
+    parser.add_argument("--session-id", type=int, default=SESSION_ID, help="xtquant 会话 ID，不填则随机")
+    parser.add_argument("--initial-cash", type=float, default=DEFAULT_INITIAL_CASH, help="无交易账号时用于估值的初始资金")
+    parser.add_argument("--period", default="1d", help="行情周期，默认 1d")
+    parser.add_argument("--dividend-type", default=DEFAULT_DIVIDEND_TYPE, help="复权方式，默认 front")
+    parser.add_argument("--price-type", choices=("latest", "fix"), default=os.environ.get("XTQUANT_PRICE_TYPE", "latest"))
+    parser.add_argument("--no-download", action="store_true", help="不自动补历史行情")
+    parser.add_argument("--sleep-seconds", type=int, default=int(os.environ.get("XTQUANT_SLEEP_SECONDS", "20") or "20"))
+    parser.add_argument(
+        "--task",
+        choices=("daily", "scan", "prepare", "rebalance", "stoploss", "afternoon", "loop"),
+        default=os.environ.get("XTQUANT_TASK", "daily"),
+        help="执行任务：daily=顺序跑一遍，loop=盘中定时循环",
+    )
+    parser.add_argument("--live-trade", action="store_true", help="打开真实委托。默认只 DRY-RUN 打印拟委托")
+    return parser
+
+
+def _config_from_args(args):
+    return StrategyConfig(
+        userdata_mini_path=args.userdata_mini,
+        account_id=args.account,
+        account_type=args.account_type,
+        session_id=args.session_id,
+        dry_run=(not args.live_trade) and DRY_RUN,
+        initial_cash=args.initial_cash,
+        period=args.period,
+        dividend_type=args.dividend_type,
+        price_type=args.price_type,
+        auto_download_history=not args.no_download,
+        sleep_seconds=args.sleep_seconds,
+    )
+
+
+def main(argv=None):
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+    config = _config_from_args(args)
+    ContextInfo = _connect_xtquant_context(config)
+    _initialize_strategy(ContextInfo)
+
+    task = args.task
+    if task == "daily":
+        _run_daily_once(ContextInfo)
+    elif task == "scan":
+        _run_scan(ContextInfo)
+    elif task == "loop":
+        _run_loop(ContextInfo)
+    elif task == "prepare":
+        _run_task(ContextInfo, "prepare", prepare_stock_list)
+    elif task == "rebalance":
+        _run_task(ContextInfo, "prepare", prepare_stock_list)
+        _run_task(ContextInfo, "rebalance", rebalance_check)
+    elif task == "stoploss":
+        _run_task(ContextInfo, "stoploss", check_stop_loss)
+    elif task == "afternoon":
+        _run_task(ContextInfo, "afternoon", trade_afternoon)
+    else:
+        raise RuntimeError("未知任务: {}".format(task))
+
+
+if __name__ == "__main__":
+    main()
